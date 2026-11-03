@@ -1,0 +1,566 @@
+use super::coverage::{FrameError, FrameSpan, SnapshotCoverage, compared_text, unevenly_read};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotDiff {
+    pub text: String,
+    pub added: usize,
+    pub removed: usize,
+    pub changed: bool,
+    /// When true, `text` is the full current snapshot for a known URL change, not a line diff,
+    /// and `added` and `removed` are zero.
+    pub url_changed: bool,
+    pub before_url: Option<String>,
+    pub after_url: Option<String>,
+    /// Whether any control moved, appeared or went away.
+    ///
+    /// A narrower question than `changed`, which is a text diff and so reads
+    /// a ticking countdown or a rotating ad as the page having changed. None
+    /// when there was no baseline to compare an arrangement against, or when the two captures
+    /// did not read the same frames.
+    pub arrangement_changed: Option<bool>,
+    /// What the current capture read, as its snapshot reports it.
+    pub coverage: SnapshotCoverage,
+    /// Frames left out of the comparison because the baseline and the current capture read them
+    /// differently. Their lines are neither removed nor added: one side could not read them.
+    pub uncompared: Vec<FrameError>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiffOptions {
+    pub context_radius: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotObservation {
+    pub text: String,
+    pub url: Option<String>,
+    pub coverage: SnapshotCoverage,
+    /// Where each child frame the capture read sits in `text`.
+    pub frames: Vec<FrameSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaggedLine {
+    gutter: char,
+    text: String,
+}
+
+pub fn diff_snapshots(before: &str, after: &str, opts: DiffOptions) -> SnapshotDiff {
+    if before == after {
+        return SnapshotDiff::default();
+    }
+
+    let mut tagged = Vec::new();
+    let mut added = 0;
+    let mut removed = 0;
+    for line in diff_lines(before, after) {
+        if line.gutter == '+' {
+            added += 1;
+        } else if line.gutter == '-' {
+            removed += 1;
+        }
+        tagged.push(line);
+    }
+
+    let body = collapse(&tagged, opts.context_radius.unwrap_or(3));
+    SnapshotDiff {
+        text: format!("{body}\n{added} added, {removed} removed"),
+        added,
+        removed,
+        changed: true,
+        url_changed: false,
+        before_url: None,
+        after_url: None,
+        // Filled in by the caller that holds both arrangements. A text diff
+        // on its own cannot answer the structural question.
+        arrangement_changed: None,
+        coverage: SnapshotCoverage::default(),
+        uncompared: Vec::new(),
+    }
+}
+
+pub fn diff_snapshot_observations(
+    before: Option<&SnapshotObservation>,
+    after: &SnapshotObservation,
+    opts: DiffOptions,
+) -> SnapshotDiff {
+    let before_url = before.and_then(|before| before.url.as_deref());
+    let after_url = after.url.as_deref();
+    if is_known_url(before_url) && is_known_url(after_url) && before_url != after_url {
+        return SnapshotDiff {
+            text: after.text.clone(),
+            added: 0,
+            removed: 0,
+            changed: true,
+            url_changed: true,
+            before_url: before_url.map(ToString::to_string),
+            after_url: after_url.map(ToString::to_string),
+            // A different url is a different page by any instrument.
+            arrangement_changed: Some(true),
+            coverage: after.coverage.clone(),
+            uncompared: Vec::new(),
+        };
+    }
+
+    let uncompared = before
+        .map(|before| {
+            unevenly_read(
+                (&before.coverage, &before.frames),
+                (&after.coverage, &after.frames),
+            )
+        })
+        .unwrap_or_default();
+    let before_text = before
+        .map(|before| compared_text(&before.text, &before.frames, &uncompared))
+        .unwrap_or_default();
+    let after_text = compared_text(&after.text, &after.frames, &uncompared);
+    let mut diff = diff_snapshots(&before_text, &after_text, opts);
+    if is_known_url(after_url) {
+        diff.after_url = after_url.map(ToString::to_string);
+    }
+    diff.coverage = after.coverage.clone();
+    diff.uncompared = uncompared;
+    diff
+}
+
+fn is_known_url(url: Option<&str>) -> bool {
+    url.is_some_and(|url| !url.is_empty() && url != "unknown")
+}
+
+fn split_lines(value: &str) -> Vec<&str> {
+    if value.is_empty() {
+        Vec::new()
+    } else {
+        value.split('\n').collect()
+    }
+}
+
+fn diff_lines(before: &str, after: &str) -> Vec<TaggedLine> {
+    let before_lines = split_lines(before);
+    let after_lines = split_lines(after);
+    let table = build_lcs_table(&before_lines, &after_lines);
+    let mut tagged = Vec::new();
+    let mut i = 0;
+    let mut j = 0;
+
+    while i < before_lines.len() && j < after_lines.len() {
+        if before_lines[i] == after_lines[j] {
+            tagged.push(TaggedLine {
+                gutter: ' ',
+                text: before_lines[i].to_string(),
+            });
+            i += 1;
+            j += 1;
+        } else if table[i + 1][j] >= table[i][j + 1] {
+            tagged.push(TaggedLine {
+                gutter: '-',
+                text: before_lines[i].to_string(),
+            });
+            i += 1;
+        } else {
+            tagged.push(TaggedLine {
+                gutter: '+',
+                text: after_lines[j].to_string(),
+            });
+            j += 1;
+        }
+    }
+
+    while i < before_lines.len() {
+        tagged.push(TaggedLine {
+            gutter: '-',
+            text: before_lines[i].to_string(),
+        });
+        i += 1;
+    }
+    while j < after_lines.len() {
+        tagged.push(TaggedLine {
+            gutter: '+',
+            text: after_lines[j].to_string(),
+        });
+        j += 1;
+    }
+
+    tagged
+}
+
+fn build_lcs_table(before: &[&str], after: &[&str]) -> Vec<Vec<usize>> {
+    let mut table = vec![vec![0; after.len() + 1]; before.len() + 1];
+    for i in (0..before.len()).rev() {
+        for j in (0..after.len()).rev() {
+            table[i][j] = if before[i] == after[j] {
+                table[i + 1][j + 1] + 1
+            } else {
+                table[i + 1][j].max(table[i][j + 1])
+            };
+        }
+    }
+    table
+}
+
+fn collapse(tagged: &[TaggedLine], radius: usize) -> String {
+    let mut keep = vec![false; tagged.len()];
+    for (index, line) in tagged.iter().enumerate() {
+        if line.gutter == ' ' {
+            continue;
+        }
+        let lo = index.saturating_sub(radius);
+        let hi = (index + radius).min(tagged.len().saturating_sub(1));
+        for item in keep.iter_mut().take(hi + 1).skip(lo) {
+            *item = true;
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut prev = None;
+    for (index, line) in tagged.iter().enumerate() {
+        if !keep[index] {
+            continue;
+        }
+        if prev.is_some_and(|prev| index - prev > 1) {
+            out.push("…".to_string());
+        }
+        out.push(format!("{} {}", line.gutter, strip_bullet(&line.text)));
+        prev = Some(index);
+    }
+    out.join("\n")
+}
+
+fn strip_bullet(line: &str) -> String {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        let leading = line.len() - trimmed.len();
+        format!("{}{}", &line[..leading], rest)
+    } else {
+        line.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DiffOptions, SnapshotDiff, SnapshotObservation, diff_snapshot_observations, diff_snapshots,
+    };
+    use crate::{
+        FrameId,
+        snapshot::{
+            FrameError, FrameOwner, FrameReadReason, FrameReadStage, FrameSpan, SnapshotCoverage,
+        },
+    };
+
+    fn frame_b_owner() -> FrameOwner {
+        FrameOwner {
+            parent: None,
+            backend_node_id: 20,
+        }
+    }
+
+    fn frame_b_error(stage: FrameReadStage) -> FrameError {
+        FrameError {
+            frame_id: Some(FrameId("b".to_string())),
+            owner: Some(frame_b_owner()),
+            stage,
+            reason: FrameReadReason::Timeout,
+        }
+    }
+
+    /// The main frame's `lines`, then frame b's iframe line followed by its contents when read.
+    fn framed(lines: &[&str], b: Option<&[&str]>, errors: Vec<FrameError>) -> SnapshotObservation {
+        let mut text = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+        text.push("- iframe".to_string());
+        let mut frames = Vec::new();
+        if let Some(b) = b {
+            let start = text.len();
+            text.extend(b.iter().map(|line| format!("  {line}")));
+            frames.push(FrameSpan {
+                frame_id: Some(FrameId("b".to_string())),
+                owner: frame_b_owner(),
+                lines: start..text.len(),
+            });
+        }
+        SnapshotObservation {
+            text: text.join("\n"),
+            url: Some("https://example.com/".to_string()),
+            coverage: SnapshotCoverage {
+                frame_errors: errors,
+            },
+            frames,
+        }
+    }
+
+    const SAVE: &str = "- button \"Save\" [ref=e1]";
+    const B: &str = "- button \"B\" [ref=e2]";
+
+    #[test]
+    fn an_unreadable_frame_is_unknown_while_the_rest_of_the_page_still_diffs() {
+        let before = framed(&[SAVE], Some(&[B]), Vec::new());
+        let after = framed(
+            &[SAVE, "- button \"New\" [ref=e3]"],
+            None,
+            vec![frame_b_error(FrameReadStage::Ax)],
+        );
+
+        let diff = diff_snapshot_observations(Some(&before), &after, DiffOptions::default());
+
+        assert_eq!((diff.added, diff.removed), (1, 0), "{}", diff.text);
+        assert!(diff.text.contains("+ button \"New\" [ref=e3]"));
+        assert!(!diff.text.contains("button \"B\""));
+        assert_eq!(diff.uncompared, vec![frame_b_error(FrameReadStage::Ax)]);
+        assert_eq!(diff.coverage, after.coverage);
+    }
+
+    #[test]
+    fn a_frame_that_reads_again_is_not_new() {
+        let before = framed(&[SAVE], None, vec![frame_b_error(FrameReadStage::Session)]);
+        let after = framed(&[SAVE], Some(&[B]), Vec::new());
+
+        let diff = diff_snapshot_observations(Some(&before), &after, DiffOptions::default());
+
+        assert!(!diff.changed, "{}", diff.text);
+        assert!(!diff.coverage.is_partial());
+        assert_eq!(
+            diff.uncompared,
+            vec![frame_b_error(FrameReadStage::Session)]
+        );
+    }
+
+    #[test]
+    fn a_frame_without_an_id_is_matched_by_its_iframe_element() {
+        let before = framed(&[SAVE], Some(&[B]), Vec::new());
+        let unidentified = FrameError {
+            frame_id: None,
+            stage: FrameReadStage::Identify,
+            ..frame_b_error(FrameReadStage::Identify)
+        };
+        let after = framed(&[SAVE], None, vec![unidentified.clone()]);
+
+        let diff = diff_snapshot_observations(Some(&before), &after, DiffOptions::default());
+
+        assert!(!diff.changed, "{}", diff.text);
+        assert_eq!(diff.uncompared, vec![unidentified]);
+    }
+
+    #[test]
+    fn a_frame_read_alike_on_both_sides_still_diffs() {
+        let degraded = || vec![frame_b_error(FrameReadStage::CursorScan)];
+        let before = framed(&[SAVE], Some(&[B]), degraded());
+        let after = framed(&[SAVE], Some(&["- button \"B2\" [ref=e2]"]), degraded());
+
+        let diff = diff_snapshot_observations(Some(&before), &after, DiffOptions::default());
+
+        assert_eq!((diff.added, diff.removed), (1, 1), "{}", diff.text);
+        assert!(diff.uncompared.is_empty());
+        assert!(diff.coverage.is_partial());
+    }
+
+    #[test]
+    fn a_frame_unread_before_and_gone_now_is_compared_as_usual() {
+        let before = framed(&[SAVE], None, vec![frame_b_error(FrameReadStage::Ax)]);
+        let after = SnapshotObservation {
+            text: SAVE.to_string(),
+            url: Some("https://example.com/".to_string()),
+            ..SnapshotObservation::default()
+        };
+
+        let diff = diff_snapshot_observations(Some(&before), &after, DiffOptions::default());
+
+        assert_eq!((diff.added, diff.removed), (0, 1), "{}", diff.text);
+        assert!(diff.text.contains("- iframe"));
+        assert!(diff.uncompared.is_empty());
+    }
+
+    #[test]
+    fn an_unevenly_read_main_frame_leaves_nothing_compared() {
+        let before = framed(&[SAVE], Some(&[B]), Vec::new());
+        let main_degraded = FrameError {
+            frame_id: None,
+            owner: None,
+            stage: FrameReadStage::CursorScan,
+            reason: FrameReadReason::BrowserError,
+        };
+        let after = framed(
+            &["- generic \"Was a target\""],
+            Some(&[B]),
+            vec![main_degraded.clone()],
+        );
+
+        let diff = diff_snapshot_observations(Some(&before), &after, DiffOptions::default());
+
+        assert!(!diff.changed, "{}", diff.text);
+        assert_eq!(diff.uncompared, vec![main_degraded]);
+    }
+
+    #[test]
+    fn identical_snapshots_short_circuit_to_no_change() {
+        let snap = "- button \"Go\" [ref=e1]";
+        assert_eq!(
+            diff_snapshots(snap, snap, DiffOptions::default()),
+            SnapshotDiff::default()
+        );
+    }
+
+    #[test]
+    fn state_change_shows_removed_added_pair_on_same_ref() {
+        let before = "- button \"Save\" [ref=e1]";
+        let after = "- button \"Save\" [ref=e1] [disabled]";
+        let diff = diff_snapshots(before, after, DiffOptions::default());
+        assert!(diff.changed);
+        assert_eq!(diff.added, 1);
+        assert_eq!(diff.removed, 1);
+        assert!(diff.text.contains("- button \"Save\" [ref=e1]"));
+        assert!(diff.text.contains("+ button \"Save\" [ref=e1] [disabled]"));
+        assert!(diff.text.contains("1 added, 1 removed"));
+    }
+
+    #[test]
+    fn pure_additions_count_only_as_added_and_strip_bullet() {
+        let before = "- main\n  - link \"Home\" [ref=e1]";
+        let after = "- main\n  - link \"Home\" [ref=e1]\n  - link \"About\" [ref=e2]";
+        let diff = diff_snapshots(before, after, DiffOptions::default());
+        assert_eq!(diff.added, 1);
+        assert_eq!(diff.removed, 0);
+        assert!(diff.text.contains("+   link \"About\" [ref=e2]"));
+    }
+
+    #[test]
+    fn stable_refs_turn_top_insertions_into_one_added_line() {
+        let before = "- button \"A\" [ref=e1]\n- link \"B\" [ref=e2]";
+        let after = [
+            "- button \"X\" [ref=e3]",
+            "- button \"A\" [ref=e1]",
+            "- link \"B\" [ref=e2]",
+        ]
+        .join("\n");
+        let diff = diff_snapshots(before, &after, DiffOptions::default());
+        assert_eq!(diff.added, 1);
+        assert_eq!(diff.removed, 0);
+        assert!(diff.text.contains("+ button \"X\" [ref=e3]"));
+        assert!(diff.text.contains("1 added, 0 removed"));
+    }
+
+    #[test]
+    fn collapses_far_apart_context_with_ellipsis() {
+        let before = (0..30)
+            .map(|index| format!("- item {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let after = before
+            .replace("- item 0", "- item ZERO")
+            .replace("- item 29", "- item LAST");
+        let diff = diff_snapshots(
+            &before,
+            &after,
+            DiffOptions {
+                context_radius: Some(2),
+            },
+        );
+        assert!(diff.text.contains('…'));
+        assert!(diff.text.contains("- item 0"));
+        assert!(diff.text.contains("+ item ZERO"));
+        assert!(diff.text.contains("+ item LAST"));
+        assert!(!diff.text.contains("item 15"));
+    }
+
+    #[test]
+    fn url_changes_return_full_current_snapshot() {
+        let before = SnapshotObservation {
+            text: "- main\n  - button \"Old page\" [ref=e1]".to_string(),
+            url: Some("https://example.com/old".to_string()),
+            ..SnapshotObservation::default()
+        };
+        let after = SnapshotObservation {
+            text: "- main\n  - heading \"New page\"".to_string(),
+            url: Some("https://example.com/new".to_string()),
+            ..SnapshotObservation::default()
+        };
+        let diff = diff_snapshot_observations(Some(&before), &after, DiffOptions::default());
+        assert_eq!(diff.text, after.text);
+        assert_eq!(diff.added, 0);
+        assert_eq!(diff.removed, 0);
+        assert!(diff.changed);
+        assert!(diff.url_changed);
+        assert_eq!(diff.before_url.as_deref(), before.url.as_deref());
+        assert_eq!(diff.after_url.as_deref(), after.url.as_deref());
+    }
+
+    #[test]
+    fn unknown_urls_keep_line_diff_behavior() {
+        let diff = diff_snapshot_observations(
+            Some(&SnapshotObservation {
+                text: "- main\n  - button \"Old\"".to_string(),
+                url: Some("unknown".to_string()),
+                ..SnapshotObservation::default()
+            }),
+            &SnapshotObservation {
+                text: "- main\n  - button \"New\"".to_string(),
+                url: Some("https://example.com/new".to_string()),
+                ..SnapshotObservation::default()
+            },
+            DiffOptions::default(),
+        );
+        assert!(diff.changed);
+        assert!(!diff.url_changed);
+        assert_eq!(diff.added, 1);
+        assert_eq!(diff.removed, 1);
+        assert!(diff.text.contains("-   button \"Old\""));
+        assert!(diff.text.contains("+   button \"New\""));
+    }
+
+    #[test]
+    fn same_url_diffs_preserve_current_url() {
+        let diff = diff_snapshot_observations(
+            Some(&SnapshotObservation {
+                text: "- main\n  - button \"Save\" [ref=e1]".to_string(),
+                url: Some("https://example.com/form".to_string()),
+                ..SnapshotObservation::default()
+            }),
+            &SnapshotObservation {
+                text: "- main\n  - button \"Saved\" [ref=e1]".to_string(),
+                url: Some("https://example.com/form".to_string()),
+                ..SnapshotObservation::default()
+            },
+            DiffOptions::default(),
+        );
+        assert!(diff.changed);
+        assert!(!diff.url_changed);
+        assert_eq!(diff.after_url.as_deref(), Some("https://example.com/form"));
+    }
+
+    /// The textual verdict and the structural one are allowed to disagree,
+    /// and on a page carrying a countdown they must.
+    #[test]
+    fn a_text_diff_alone_does_not_answer_whether_the_page_moved() {
+        let before = SnapshotObservation {
+            text: "link \"Deal of the Day, Ends in 08:54:33\"".to_string(),
+            url: Some("https://example.com/".to_string()),
+            ..SnapshotObservation::default()
+        };
+        let after = SnapshotObservation {
+            text: "link \"Deal of the Day, Ends in 08:54:32\"".to_string(),
+            url: Some("https://example.com/".to_string()),
+            ..SnapshotObservation::default()
+        };
+        let diff = diff_snapshot_observations(Some(&before), &after, DiffOptions::default());
+        assert!(diff.changed, "the text really did change");
+        assert_eq!(
+            diff.arrangement_changed, None,
+            "a text diff cannot answer the structural question on its own"
+        );
+    }
+
+    #[test]
+    fn a_url_change_is_a_change_of_page_whatever_the_controls_did() {
+        let before = SnapshotObservation {
+            text: "button \"Go\"".to_string(),
+            url: Some("https://example.com/".to_string()),
+            ..SnapshotObservation::default()
+        };
+        let after = SnapshotObservation {
+            text: "button \"Go\"".to_string(),
+            url: Some("https://example.com/next".to_string()),
+            ..SnapshotObservation::default()
+        };
+        let diff = diff_snapshot_observations(Some(&before), &after, DiffOptions::default());
+        assert_eq!(diff.arrangement_changed, Some(true));
+    }
+}

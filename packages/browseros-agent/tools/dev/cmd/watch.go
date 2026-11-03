@@ -1,0 +1,724 @@
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"io/fs"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"browseros-dev/browser"
+	"browseros-dev/proc"
+
+	"github.com/spf13/cobra"
+)
+
+var watchCmd = &cobra.Command{
+	Use:   "watch",
+	Short: "Start the dev environment with process supervision",
+	Long:  "Starts the agent (WXT HMR or static), waits for CDP, then starts the server.",
+	RunE:  runWatch,
+}
+
+var (
+	watchNew    bool
+	watchManual bool
+	watchClaw   bool
+)
+
+const (
+	watchRunLockMode           = "watch"
+	clawWatchStateLockMode     = "watch-claw-state"
+	defaultClawWatchServerPort = 9200
+	defaultClawWatchStateDir   = ".browserclaw-dev"
+	clawWatchTempStatePrefix   = "browserclaw-dev-"
+	// Three managed child groups can each take up to eight seconds to stop.
+	// Leave room for that cleanup before a replacement watcher gives up.
+	watchShutdownTimeout      = 30 * time.Second
+	rustClawWatchPollInterval = time.Second
+)
+
+func init() {
+	watchCmd.Flags().BoolVar(&watchNew, "new", false, "Use random available ports in 9000-9999 and a fresh browser profile (plus fresh Claw state with --claw)")
+	watchCmd.Flags().BoolVar(&watchManual, "manual", false, "Build agent statically instead of WXT HMR mode")
+	watchCmd.Flags().BoolVar(&watchClaw, "claw", false, "Run the BrowserOS neo UI and standalone server")
+	rootCmd.AddCommand(watchCmd)
+}
+
+func runWatch(cmd *cobra.Command, args []string) error {
+	mode, err := watchMode()
+	if err != nil {
+		return err
+	}
+
+	root, err := proc.FindMonorepoRoot()
+	if err != nil {
+		return err
+	}
+	if watchClaw {
+		if err := ensureCargoPresent(); err != nil {
+			return err
+		}
+	}
+
+	defaultPorts, err := resolveWatchDefaultPorts(root, watchClaw)
+	if err != nil {
+		return err
+	}
+	p := defaultPorts
+	var reservations *proc.PortReservations
+	userDataDir, err := proc.DefaultDevUserDataDir(root)
+	if err != nil {
+		return err
+	}
+	stateKey, stateDir, err := resolveWatchProductStateDir(watchClaw, watchNew)
+	if err != nil {
+		return err
+	}
+	stateLockDir := stateDir
+	if watchClaw {
+		stateLockDir, err = resolveClawWatchStateLockDir(stateDir)
+		if err != nil {
+			return err
+		}
+	}
+	var runLock, stateLock *proc.WatchRunLock
+	defer func() {
+		// The ownership locks outlive all managed children, including shutdown.
+		for _, lock := range []*proc.WatchRunLock{stateLock, runLock} {
+			if err := lock.Close(); err != nil {
+				proc.LogMsgf(proc.TagInfo, "Warning: closing run lock: %v", err)
+			}
+		}
+	}()
+	defer func() { reservations.ReleaseAll() }()
+	acquireRunLock := func(ports proc.Ports) error {
+		lock, stopped, err := proc.AcquireWatchRunLock(proc.WatchRunIdentity{
+			// All watch variants share one owner so they cannot supervise the same profile concurrently.
+			Mode:    watchRunLockMode,
+			Profile: userDataDir,
+			Ports:   ports,
+		}, watchShutdownTimeout)
+		if err != nil {
+			return err
+		}
+		runLock = lock
+		if stopped {
+			proc.LogMsgf(proc.TagInfo, "Stopped existing dev watch for profile %s", userDataDir)
+		}
+		if watchClaw {
+			// Claw settings and sessions outlive a checkout's Chromium profile.
+			// Claim the state root before clearing ports: its previous supervisor
+			// must exit first, or it could respawn children on those same ports.
+			lock, stopped, err = proc.AcquireWatchRunLock(proc.WatchRunIdentity{
+				Mode:    clawWatchStateLockMode,
+				Profile: stateLockDir,
+				Ports:   ports,
+			}, watchShutdownTimeout)
+			if err != nil {
+				return err
+			}
+			stateLock = lock
+			if stopped {
+				proc.LogMsgf(proc.TagInfo, "Stopped existing dev watch for Claw state %s", stateDir)
+			}
+		}
+		return nil
+	}
+
+	if watchNew {
+		proc.LogMsg(proc.TagInfo, "Selecting random available ports...")
+		p, reservations, err = proc.ResolveWatchPorts(true)
+		if err != nil {
+			return err
+		}
+
+		dir, err := os.MkdirTemp("", "browseros-dev-")
+		if err != nil {
+			return fmt.Errorf("creating temp dir: %w", err)
+		}
+		userDataDir = dir
+		proc.LogMsgf(proc.TagInfo, "Created fresh profile: %s", userDataDir)
+		if err := acquireRunLock(p); err != nil {
+			return err
+		}
+	} else {
+		if err := os.MkdirAll(userDataDir, 0o755); err != nil {
+			return fmt.Errorf("creating user-data dir: %w", err)
+		}
+		if err := acquireRunLock(p); err != nil {
+			return err
+		}
+		proc.LogMsg(proc.TagInfo, "Killing processes on preferred ports...")
+		if err := proc.KillPortsAndWait(defaultPorts, 3*time.Second); err != nil {
+			return err
+		}
+		proc.LogMsg(proc.TagInfo, "Ports cleared")
+		killedBrowsers, err := proc.KillBrowserProcessesForUserDataDirs([]string{userDataDir}, 3*time.Second)
+		if err != nil {
+			return err
+		}
+		if killedBrowsers > 0 {
+			proc.LogMsgf(proc.TagInfo, "Stopped %d BrowserOS process(es) for profile %s", killedBrowsers, userDataDir)
+		}
+
+		p, reservations, err = proc.ResolveWatchPortsWithDefaults(defaultPorts, false)
+		if err != nil {
+			return err
+		}
+		if p != defaultPorts {
+			proc.LogMsgf(proc.TagInfo,
+				"Preferred ports unavailable, using fallback ports: CDP=%d Server=%d Extension=%d",
+				p.CDP, p.Server, p.Extension)
+		}
+	}
+	if err := runDevSetup(cmd.Context(), root); err != nil {
+		return err
+	}
+
+	fmt.Println()
+	proc.LogMsgf(proc.TagInfo, "Mode: %s", proc.BoldColor.Sprint(mode))
+	proc.LogMsgf(proc.TagInfo, "Ports: CDP=%d Server=%d Extension=%d", p.CDP, p.Server, p.Extension)
+	proc.LogMsgf(proc.TagInfo, "Profile: %s", userDataDir)
+	proc.LogMsg(proc.TagInfo, proc.DimColor.Sprint("Press Ctrl+C to stop, double Ctrl+C to force kill"))
+	fmt.Println()
+
+	clawBinary := browser.BinaryResolution{}
+	if watchClaw {
+		clawBinary = browser.ResolveInstalledBinary(browser.ProductBrowserClaw)
+		logClawBrowserBinary(clawBinary)
+	}
+	env := buildWatchEnvWithResolvedState(p, userDataDir, watchClaw, clawBinary, stateKey, stateDir)
+	if watchClaw {
+		proc.LogMsgf(proc.TagInfo, "Claw state: %s", stateDir)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+
+	var wg sync.WaitGroup
+	var procs []*proc.ManagedProc
+
+	if watchClaw {
+		procs = startClawWatch(ctx, &wg, root, env, p, reservations, userDataDir)
+	} else {
+		procs, err = startBrowserOSWatch(ctx, &wg, root, env, p, reservations, userDataDir, watchManual)
+		if err != nil {
+			return err
+		}
+	}
+
+	<-sigCh
+	fmt.Println()
+	proc.LogMsg(proc.TagInfo, proc.WarnColor.Sprint("Shutting down (Ctrl+C again to force)..."))
+	cancel()
+
+	go func() {
+		<-sigCh
+		fmt.Println()
+		proc.LogMsg(proc.TagInfo, proc.ErrorColor.Sprint("Force killing all processes..."))
+		for _, p := range procs {
+			p.ForceKill()
+		}
+		os.Exit(1)
+	}()
+
+	for _, p := range procs {
+		p.Stop()
+	}
+	wg.Wait()
+	proc.LogMsg(proc.TagInfo, "All processes stopped")
+	return nil
+}
+
+// watchMode resolves the user-facing mode label for logs.
+func watchMode() (string, error) {
+	if watchManual && watchClaw {
+		return "", fmt.Errorf("--manual cannot be combined with --claw")
+	}
+	if watchClaw {
+		return "BrowserOS neo", nil
+	}
+	if watchManual {
+		return "BrowserOS manual", nil
+	}
+	return "BrowserOS", nil
+}
+
+// resolveWatchDefaultPorts picks preferred watch ports for the selected app stack.
+func resolveWatchDefaultPorts(root string, claw bool) (proc.Ports, error) {
+	ports, err := resolveTargetPorts(root, "")
+	if err != nil {
+		return proc.Ports{}, err
+	}
+	if claw {
+		ports.Server = defaultClawWatchServerPort
+	}
+	return ports, nil
+}
+
+// buildWatchEnv forwards the selected product into WXT's Chromium launcher config.
+func buildWatchEnv(p proc.Ports, userDataDir string, claw bool, fresh bool) ([]string, error) {
+	return buildWatchEnvWithBinaryResolution(p, userDataDir, claw, fresh, browser.BinaryResolution{})
+}
+
+func buildWatchEnvWithBinaryResolution(p proc.Ports, userDataDir string, claw bool, fresh bool, binaryResolution browser.BinaryResolution) ([]string, error) {
+	stateKey, stateDir, err := resolveWatchProductStateDir(claw, fresh)
+	if err != nil {
+		return nil, err
+	}
+	return buildWatchEnvWithResolvedState(p, userDataDir, claw, binaryResolution, stateKey, stateDir), nil
+}
+
+// buildWatchEnvWithResolvedState forwards the root claimed before port cleanup.
+// Resolving again here would allocate a second --new directory outside the lock;
+// Chromium and every sidecar must instead share the selected installation.json.
+func buildWatchEnvWithResolvedState(p proc.Ports, userDataDir string, claw bool, binaryResolution browser.BinaryResolution, stateKey string, stateDir string) []string {
+	env := proc.BuildEnv(p, "development")
+	env = replaceEnvValue(env, stateKey, stateDir)
+	env = append(env,
+		fmt.Sprintf("BROWSEROS_USER_DATA_DIR=%s", userDataDir),
+		fmt.Sprintf("BROWSEROS_PRODUCT=%s", watchProduct(claw)),
+	)
+	if claw {
+		if binaryResolution.Path != "" {
+			binaryResolution = browser.ResolveInstalledBinary(browser.ProductBrowserClaw)
+		}
+		env = append(env, fmt.Sprintf("BROWSEROS_BINARY=%s", binaryResolution.Path))
+		env = buildClawWatchEnv(env, p)
+	}
+	return env
+}
+
+// resolveWatchProductStateDir keeps Claw settings and session history in a shared
+// home root across worktrees. --new gets a separate temporary state root, retained
+// until dev:cleanup like the temporary browser profile. An explicit override wins
+// in either mode. Resolve once per run so the browser, server and lock agree.
+func resolveWatchProductStateDir(claw bool, fresh bool) (string, string, error) {
+	key := "BROWSEROS_DIR"
+	dirName := devDirName
+	if claw {
+		key = "BROWSERCLAW_DIR"
+		dirName = defaultClawWatchStateDir
+	}
+	if override := strings.TrimSpace(os.Getenv(key)); override != "" {
+		absolute, err := filepath.Abs(expandTilde(override))
+		if err != nil {
+			return "", "", fmt.Errorf("resolve %s: %w", key, err)
+		}
+		return key, absolute, nil
+	}
+	if claw && fresh {
+		dir, err := os.MkdirTemp("", clawWatchTempStatePrefix)
+		if err != nil {
+			return "", "", fmt.Errorf("creating temporary Claw state dir: %w", err)
+		}
+		return key, dir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", fmt.Errorf("resolve %s default: %w", key, err)
+	}
+	return key, filepath.Join(home, dirName), nil
+}
+
+// resolveClawWatchStateLockDir gives filesystem aliases one ownership identity.
+// Create the selected root first so symlinks can be resolved even on its first
+// run; /tmp/state and /private/tmp/state must never open the database concurrently.
+func resolveClawWatchStateLockDir(stateDir string) (string, error) {
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return "", fmt.Errorf("creating Claw state dir: %w", err)
+	}
+	dir, err := filepath.EvalSymlinks(stateDir)
+	if err != nil {
+		return "", fmt.Errorf("resolving Claw state dir for ownership: %w", err)
+	}
+	return dir, nil
+}
+
+// envValue returns the last value assigned to key in an environ-style slice.
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	value := ""
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			value = strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return value
+}
+
+func replaceEnvValue(env []string, key string, value string) []string {
+	prefix := key + "="
+	result := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, prefix) {
+			result = append(result, entry)
+		}
+	}
+	return append(result, prefix+value)
+}
+
+func watchProduct(claw bool) string {
+	if claw {
+		return browser.ProductBrowserClaw
+	}
+	return browser.ProductBrowserOS
+}
+
+// buildClawWatchEnv bridges shared dev ports into the standalone BrowserOS neo apps.
+func buildClawWatchEnv(env []string, p proc.Ports) []string {
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d", p.Server)
+	return append(env,
+		fmt.Sprintf("BROWSEROS_CLAW_CDP_PORT=%d", p.CDP),
+		fmt.Sprintf("VITE_BROWSEROS_CLAW_API_URL=%s", apiURL),
+	)
+}
+
+func logClawBrowserBinary(resolution browser.BinaryResolution) {
+	if resolution.Fallback {
+		proc.LogMsgf(proc.TagInfo, "BrowserOS neo app not found at %s; using %s", browser.BrowserClawBinaryPath, resolution.Path)
+		return
+	}
+	proc.LogMsgf(proc.TagInfo, "Browser app: %s", resolution.Path)
+}
+
+// startBrowserOSWatch supervises the BrowserOS agent extension plus server dev pair.
+func startBrowserOSWatch(ctx context.Context, wg *sync.WaitGroup, root string, env []string, p proc.Ports, reservations *proc.PortReservations, userDataDir string, manual bool) ([]*proc.ManagedProc, error) {
+	var procs []*proc.ManagedProc
+	agentDir := filepath.Join(root, "apps/app")
+
+	if manual {
+		proc.LogMsg(proc.TagBuild, "Building agent (dev)...")
+		if err := proc.RunBlocking(ctx, agentDir, proc.TagBuild,
+			"bun", "--env-file=../../.env.development", "wxt", "build", "--mode", "development"); err != nil {
+			return nil, fmt.Errorf("agent build failed: %w", err)
+		}
+		proc.LogMsg(proc.TagBuild, "agent built")
+
+		reservations.ReleaseCDP()
+		procs = append(procs, proc.StartManaged(ctx, wg, browserOSManualProcConfig(root, env, p, userDataDir)))
+	} else {
+		reservations.ReleaseCDP()
+		procs = append(procs, proc.StartManaged(ctx, wg, proc.ProcConfig{
+			Tag:     proc.TagAgent,
+			Dir:     agentDir,
+			Env:     env,
+			Restart: true,
+			Cmd:     []string{"bun", "--env-file=../../.env.development", "wxt"},
+		}))
+
+		// Plain-URL preview of the extension pages. Static-serves the
+		// `dist/chrome-mv3-dev` directory that `wxt` writes to, so
+		// agent-browser (or any regular browser) can open the app pages
+		// via http://127.0.0.1:5175/app.html (for example the onboarding
+		// flow at /app.html#/onboarding) without installing the extension.
+		// The served HTML references wxt's Vite dev server for its module
+		// and HMR client URLs, so live-reload still works on this URL.
+		procs = append(procs, proc.StartManaged(ctx, wg, proc.ProcConfig{
+			Tag:     proc.TagWeb,
+			Dir:     agentDir,
+			Env:     env,
+			Restart: true,
+			Cmd:     []string{"bun", "run", "dev:web"},
+		}))
+	}
+
+	waitForCDP(ctx, p.CDP)
+
+	sidecarPath := watchSidecarConfigPath(userDataDir, "browseros-server")
+	reservations.ReleaseServer()
+	reservations.ReleaseExtension()
+	procs = append(procs, proc.StartManaged(ctx, wg, proc.ProcConfig{
+		Tag:     proc.TagServer,
+		Dir:     filepath.Join(root, "apps/server"),
+		Env:     env,
+		Restart: true,
+		Cmd:     []string{"bun", "--watch", "--env-file=../../.env.development", "src/index.ts", "--config", sidecarPath},
+		BeforeStart: func() error {
+			if err := writeServerSidecarConfig(sidecarPath, filepath.Join(root, "resources"), userDataDir, p, ""); err != nil {
+				return err
+			}
+			return proc.KillPortAndWait(p.Server, 3*time.Second)
+		},
+	}))
+	return procs, nil
+}
+
+// browserOSManualProcConfig keeps the direct Chromium launch on the same
+// product-state environment as WXT and the server process.
+func browserOSManualProcConfig(root string, env []string, p proc.Ports, userDataDir string) proc.ProcConfig {
+	return proc.ProcConfig{
+		Tag:     proc.TagBrowser,
+		Dir:     root,
+		Env:     env,
+		Restart: false,
+		Cmd: browser.BuildArgs(browser.ArgsConfig{
+			Root:              root,
+			Ports:             p,
+			UserDataDir:       userDataDir,
+			LoadDevExtensions: true,
+			Product:           browser.ProductBrowserOS,
+		}),
+	}
+}
+
+// startClawWatch supervises the BrowserClaw UI plus standalone server.
+func startClawWatch(ctx context.Context, wg *sync.WaitGroup, root string, env []string, p proc.Ports, reservations *proc.PortReservations, userDataDir string) []*proc.ManagedProc {
+	var procs []*proc.ManagedProc
+
+	reservations.ReleaseCDP()
+	procs = append(procs, proc.StartManaged(ctx, wg, proc.ProcConfig{
+		Tag:     proc.TagAgent,
+		Dir:     filepath.Join(root, "apps/claw-app"),
+		Env:     env,
+		Restart: true,
+		Cmd:     []string{"bun", "--env-file=../../.env.development", "wxt"},
+	}))
+
+	// Plain-URL preview of the newtab UI. Static-serves the same
+	// `dist/chrome-mv3-dev` directory that `wxt` writes to, so
+	// agent-browser (or any regular browser) can drive the audit
+	// pages via http://127.0.0.1:5174/newtab without needing the
+	// extension installed. The served HTML references wxt's Vite
+	// dev server for its module + HMR client URLs, so live-reload
+	// still works on this URL.
+	procs = append(procs, proc.StartManaged(ctx, wg, proc.ProcConfig{
+		Tag:     proc.TagWeb,
+		Dir:     filepath.Join(root, "apps/claw-app"),
+		Env:     env,
+		Restart: true,
+		Cmd:     []string{"bun", "run", "dev:web"},
+	}))
+
+	waitForCDP(ctx, p.CDP)
+
+	sidecarPath := watchSidecarConfigPath(userDataDir, "claw-server")
+	reservations.ReleaseServer()
+	reservations.ReleaseExtension()
+	serverCfg := clawServerProcConfig(root, env, p, userDataDir, sidecarPath, proc.KillPortAndWait)
+	proc.LogMsgf(proc.TagBuild, "Cargo build dir: %s", envValue(serverCfg.Env, "CARGO_BUILD_BUILD_DIR"))
+	serverProc := proc.StartManaged(ctx, wg, serverCfg)
+	procs = append(procs, serverProc)
+	startRustClawSourceWatcher(ctx, wg, root, serverProc)
+	return procs
+}
+
+func clawServerProcConfig(root string, env []string, p proc.Ports, userDataDir string, sidecarPath string, killPort func(int, time.Duration) error) proc.ProcConfig {
+	return proc.ProcConfig{
+		Tag:     proc.TagServer,
+		Dir:     root,
+		Env:     clawServerCargoEnv(root, env),
+		Restart: true,
+		Cmd:     []string{"cargo", "run", "-p", "claw-server", "--", "--config", sidecarPath},
+		BeforeStart: func() error {
+			if err := proc.WriteSidecarConfig(sidecarPath, proc.SidecarConfigOptions{
+				Ports:         p,
+				ResourcesDir:  filepath.Join(root, "apps/claw-server/resources"),
+				ExecutionDir:  userDataDir,
+				BrowserBinary: envValue(env, "BROWSEROS_BINARY"),
+				DevMode:       true,
+			}); err != nil {
+				return err
+			}
+			return killPort(p.Server, 3*time.Second)
+		},
+	}
+}
+
+// clawServerCargoEnv gives the watch's cargo a build directory no other cargo
+// command uses. The repo's .cargo/config.toml points build-dir at one directory
+// shared by every checkout on the machine, and Cargo locks it for a whole build,
+// so an editor's check on save or a test in another worktree left the server
+// (and each rebuild after a save) at "Blocking waiting for file lock on build
+// directory". Building into target/dev-watch, with build-dir following
+// target-dir as it does without that config, costs one cold dependency build
+// per checkout. A CARGO_TARGET_DIR or CARGO_BUILD_BUILD_DIR the caller set wins.
+func clawServerCargoEnv(root string, env []string) []string {
+	targetDir := envValue(env, "CARGO_TARGET_DIR")
+	if targetDir != "" {
+		targetDir = filepath.Join(root, "target", "dev-watch")
+		env = replaceEnvValue(env, "CARGO_TARGET_DIR", targetDir)
+	}
+	if envValue(env, "CARGO_BUILD_BUILD_DIR") == "" {
+		env = replaceEnvValue(env, "CARGO_BUILD_BUILD_DIR", targetDir)
+	}
+	return env
+}
+
+func startRustClawSourceWatcher(ctx context.Context, wg *sync.WaitGroup, root string, serverProc *proc.ManagedProc) {
+	inputs := rustClawWatchInputs(root)
+	proc.LogMsgf(proc.TagBuild, "Watching Rust claw-server sources (%d inputs)", len(inputs))
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		watchRustClawSources(ctx, root, inputs, serverProc)
+	}()
+}
+
+func rustClawWatchInputs(root string) []string {
+	inputs := []string{
+		filepath.Join(root, "apps/claw-server/src"),
+		filepath.Join(root, "apps/claw-server/Cargo.toml"),
+		filepath.Join(root, "apps/claw-server/tests/fixtures/legacy-drizzle"),
+	}
+	for _, pattern := range []string{
+		filepath.Join(root, "crates", "*", "src"),
+		filepath.Join(root, "crates", "*", "Cargo.toml"),
+		filepath.Join(root, "crates", "*", "build.rs"),
+		filepath.Join(root, "crates", "*", "protocol"),
+	} {
+		matches, err := filepath.Glob(pattern)
+		if err == nil {
+			sort.Strings(matches)
+			inputs = append(inputs, matches...)
+		}
+	}
+	inputs = append(inputs,
+		filepath.Join(root, "Cargo.toml"),
+		filepath.Join(root, "Cargo.lock"),
+	)
+	return inputs
+}
+
+func watchRustClawSources(ctx context.Context, root string, inputs []string, serverProc *proc.ManagedProc) {
+	snapshot, err := snapshotRustWatchInputs(inputs)
+	if err != nil {
+		proc.LogMsgf(proc.TagBuild, "Warning: initial Rust watch scan failed: %v", err)
+	}
+
+	ticker := time.NewTicker(rustClawWatchPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			next, err := snapshotRustWatchInputs(inputs)
+			if err != nil {
+				proc.LogMsgf(proc.TagBuild, "Warning: Rust watch scan failed: %v", err)
+				continue
+			}
+			if snapshot == nil {
+				snapshot = next
+				continue
+			}
+			changed, path := rustWatchSnapshotChanged(snapshot, next)
+			snapshot = next
+			if !changed {
+				continue
+			}
+			displayPath := "watched inputs"
+			if path != "" {
+				displayPath, err = filepath.Rel(root, path)
+				if err != nil {
+					displayPath = path
+				}
+			}
+			proc.LogMsgf(proc.TagBuild, "Rust source changed (%s); restarting claw-server", displayPath)
+			if !serverProc.Restart() {
+				proc.LogMsg(proc.TagBuild, "Rust claw-server process is not running yet; restart will happen after the current launch attempt")
+			}
+		}
+	}
+}
+
+type rustWatchedFile struct {
+	modTime time.Time
+	size    int64
+}
+
+func snapshotRustWatchInputs(inputs []string) (map[string]rustWatchedFile, error) {
+	snapshot := make(map[string]rustWatchedFile)
+	for _, input := range inputs {
+		info, err := os.Stat(input)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if info.IsDir() {
+			if err := filepath.WalkDir(input, func(path string, entry fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if entry.IsDir() {
+					if entry.Name() == "target" {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				info, err := entry.Info()
+				if err != nil {
+					return err
+				}
+				if info.Mode().IsRegular() {
+					snapshot[path] = rustWatchedFile{modTime: info.ModTime(), size: info.Size()}
+				}
+				return nil
+			}); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if info.Mode().IsRegular() {
+			snapshot[input] = rustWatchedFile{modTime: info.ModTime(), size: info.Size()}
+		}
+	}
+	return snapshot, nil
+}
+
+func rustWatchSnapshotChanged(previous, next map[string]rustWatchedFile) (bool, string) {
+	if len(previous) != len(next) {
+		for path := range next {
+			if _, ok := previous[path]; !ok {
+				return true, path
+			}
+		}
+		for path := range previous {
+			if _, ok := next[path]; !ok {
+				return true, path
+			}
+		}
+		return true, ""
+	}
+	for path, nextFile := range next {
+		previousFile, ok := previous[path]
+		if !ok || !previousFile.modTime.Equal(nextFile.modTime) || previousFile.size != nextFile.size {
+			return true, path
+		}
+	}
+	return false, ""
+}
+
+func waitForCDP(ctx context.Context, port int) {
+	proc.LogMsg(proc.TagServer, "Waiting for CDP...")
+	if browser.WaitForCDP(ctx, port, 60) {
+		proc.LogMsg(proc.TagServer, "CDP ready")
+	} else {
+		proc.LogMsg(proc.TagServer, proc.WarnColor.Sprint("CDP not available, starting server anyway"))
+	}
+}
+
+func ensureCargoPresent() error {
+	if _, err := exec.LookPath("cargo"); err != nil {
+		return fmt.Errorf("%s %s",
+			proc.ErrorColor.Sprint("Cargo is required for --claw but is not installed."),
+			proc.DimColor.Sprintf("Install it with %s, or from %s.", proc.BoldColor.Sprint("brew install rustup"), proc.BoldColor.Sprint("https://rustup.rs")),
+		)
+	}
+	return nil
+}

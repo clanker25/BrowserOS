@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Upload fixture</title>
+  </head>
+  <body>
+    <h1>Upload fixture</h1>
+    <label>Single upload <input id="single" type="file" /></label>
+    <div id="single-names">none</div>
+    <label>Multi upload <input id="multi" type="file" multiple /></label>
+    <div id="multi-names">none</div>
+    <input id="hidden-file" type="file" hidden>
+    <button id="upload-button" onclick="document.getElementById('hidden-file').click()">Attach document</button>
+    <output id="hidden-names">none</output>
+    <script>
+      if (new URLSearchParams(location.search).has('parentPicker')) {
+        const button = document.getElementById('upload-button')
+        button.textContent = 'Attach to parent'
+        button.onclick = () => parent.postMessage('open-parent-picker', '*')
+      }
+      const report = (input, target) => {
+        const names = [...input.files].map((file) => file.name).join(',')
+        document.getElementById(target).textContent = names || 'none'
+      }
+      document.getElementById('hidden-file').addEventListener('change', (event) => {
+        report(event.target, 'hidden-names')
+        document.getElementById('upload-button').textContent = 'Attached ' + [...event.target.files].map((file) => file.name).join(',')
+      })
+      document.getElementById('single').addEventListener('change', (event) => {
+        report(event.target, 'single-names')
+      })
+      document.getElementById('multi').addEventListener('change', (event) => {
+        report(event.target, 'multi-names')
+      })
+    </script>
+  </body>
+</html>
