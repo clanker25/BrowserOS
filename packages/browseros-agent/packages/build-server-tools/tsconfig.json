@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "types": ["bun"],
+    "resolveJsonModule": false
+  },
+  "include": ["src/**/*", "tests/**/*", "package.json"]
+}

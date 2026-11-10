@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Snapshot cursor concurrency fixture</title>
+    <style>
+      .cursor-candidate,
+      #pointer-only {
+        cursor: pointer;
+      }
+      #editable-target {
+        border: 1px dashed #666;
+        min-height: 24px;
+        width: 320px;
+      }
+      #zero-sized-excluded {
+        display: inline-block;
+        width: 0;
+        height: 0;
+        overflow: visible;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Snapshot cursor concurrency fixture</h1>
+    <div
+      id="generated-batch"
+      data-first-label="Cursor candidate 00"
+      data-middle-label="Cursor candidate 32"
+      data-last-label="Cursor candidate 63"
+    ></div>
+
+    <div id="pointer-only" role="group" aria-label="Pointer-only target">
+      Pointer-only target
+    </div>
+    <div
+      id="assigned-onclick"
+      role="group"
+      aria-label="Assigned onclick target"
+    >
+      Assigned onclick target
+    </div>
+    <div
+      id="editable-target"
+      contenteditable="true"
+      role="group"
+      aria-label="Editable target ready"
+    >
+      Editable target ready
+    </div>
+    <span
+      id="tabindex-target"
+      tabindex="0"
+      role="group"
+      aria-label="Tabindex target"
+    >
+      Tabindex target
+    </span>
+    <span
+      id="zero-sized-excluded"
+      role="group"
+      aria-label="Zero-sized excluded target"
+    >
+      Zero-sized excluded target
+    </span>
+    <div id="page-owned-marker" data-__bcid-page-owned="fixture-owned">
+      Page-owned marker sentinel
+    </div>
+    <output id="cursor-action-result">Cursor action untouched</output>
+
+    <script>
+      // A snapshot reads the page without writing to it. Every DOM mutation after a reset is
+      // counted, and the page-owned attribute that looks like an old snapshot marker must stay.
+      const pageOwnedMarker = 'data-__bcid-page-owned'
+      let mutations = 0
+      new MutationObserver((records) => {
+        mutations += records.length
+      }).observe(document.documentElement, {
+        attributes: true,
+        childList: true,
+        characterData: true,
+        subtree: true,
+      })
+      const generatedBatch = document.getElementById('generated-batch')
+      for (let index = 0; index < 64; index += 1) {
+        const candidate = document.createElement('div')
+        candidate.className = 'cursor-candidate'
+        candidate.textContent = `Cursor candidate ${String(index).padStart(2, '0')}`
+        candidate.setAttribute('role', 'group')
+        candidate.setAttribute('aria-label', candidate.textContent)
+        generatedBatch.append(candidate)
+      }
+
+      document.getElementById('pointer-only').addEventListener('click', () => {
+        document.getElementById('cursor-action-result').textContent =
+          'Pointer-only target clicked'
+      })
+      document.getElementById('assigned-onclick').onclick = () => {
+        document.getElementById('cursor-action-result').textContent =
+          'Assigned onclick target clicked'
+      }
+
+      window.snapshotCursorFixture = {
+        ready: true,
+        resetProbe() {
+          mutations = 0
+        },
+        state() {
+          const sentinel = document.getElementById('page-owned-marker')
+          return {
+            candidateCount:
+              document.querySelectorAll('.cursor-candidate').length,
+            mutations,
+            sentinelPresent:
+              sentinel?.getAttribute(pageOwnedMarker) === 'fixture-owned',
+          }
+        },
+      }
+    </script>
+  </body>
+</html>

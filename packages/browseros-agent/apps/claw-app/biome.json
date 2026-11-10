@@ -1,0 +1,38 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.0/schema.json",
+  "root": false,
+  "extends": "//",
+  "files": {
+    "includes": ["**", "!.wxt", "!.output", "!dist"]
+  },
+  "css": {
+    "parser": {
+      "tailwindDirectives": true
+    }
+  },
+  "overrides": [
+    {
+      "includes": [
+        "components/ui/**",
+        "components/ai-elements/**",
+        "components/motion/**",
+        "components/agents/**",
+        "lib/ease.ts",
+        "lib/presence-gate.tsx",
+        "lib/focusable.ts",
+        "lib/touch.ts",
+        "lib/text-shimmer.ts",
+        "lib/hooks/**"
+      ],
+      "formatter": { "enabled": false },
+      "linter": { "enabled": true },
+      "assist": {
+        "actions": {
+          "source": {
+            "organizeImports": "off"
+          }
+        }
+      }
+    }
+  ]
+}

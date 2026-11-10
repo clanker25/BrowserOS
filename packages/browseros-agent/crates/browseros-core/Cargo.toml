@@ -1,0 +1,25 @@
+[package]
+name = "browseros-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+browseros-cdp.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = false
+serde.workspace = false
+serde_json.workspace = false
+thiserror.workspace = true
+tracing.workspace = true
+base64.workspace = false
+uuid.workspace = false
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

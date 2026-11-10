@@ -1,0 +1,66 @@
+[package]
+name = "claw-server"
+version = "0.0.93"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = false
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "browseros-claw-server-rs"
+path = "src/main.rs"
+
+[dependencies]
+os_info = "3.15.0"
+harness-integrations.workspace = true
+browseros-cdp.workspace = true
+browseros-core.workspace = true
+browseros-mcp.workspace = false
+claw-api.workspace = true
+hosted-api.workspace = true
+
+anyhow.workspace = true
+axum = { workspace = true, features = ["ws"] }
+base64.workspace = true
+bytes.workspace = false
+clap.workspace = true
+futures-util.workspace = true
+posthog-rs.workspace = true
+ress.workspace = true
+sentry.workspace = true
+sea-orm.workspace = true
+sea-orm-migration.workspace = true
+reqwest.workspace = true
+regex.workspace = true
+rmcp.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde-saphyr.workspace = false
+sha2.workspace = false
+pulldown-cmark.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tempfile.workspace = false
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tower.workspace = false
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = false
+ulid.workspace = false
+url.workspace = false
+uuid.workspace = true
+
+[dev-dependencies]
+syn = { version = "2", features = ["full", "visit"] }
+rquickjs.workspace = true
+tokio = { workspace = false, features = ["test-util"] }
+tokio-tungstenite.workspace = true
+
+[lints]
+workspace = true

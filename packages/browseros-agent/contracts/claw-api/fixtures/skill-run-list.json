@@ -1,0 +1,29 @@
+{
+  "items": [
+    {
+      "id": "run_0000000000000000000018",
+      "skillName": "masason-email-sweep",
+      "sessionId": "sess_run18",
+      "runNumber": 17,
+      "agentId": "Claude Code",
+      "tokens": 14500,
+      "durationMs": 161000,
+      "toolCount": 6,
+      "clean": false,
+      "createdAt": 1786000000000
+    },
+    {
+      "id": "run_0000000000000000000017",
+      "skillName": "masason-email-sweep",
+      "sessionId": "sess_run17",
+      "runNumber": 17,
+      "agentId": "Codex",
+      "tokens": 18100,
+      "durationMs": 174000,
+      "toolCount": 7,
+      "clean": true,
+      "erroredTool": "compose",
+      "createdAt": 1785800000000
+    }
+  ]
+}
