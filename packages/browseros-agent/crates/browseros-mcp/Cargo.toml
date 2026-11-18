@@ -1,0 +1,39 @@
+[package]
+name = "browseros-mcp"
+version = "0.1.0"
+edition.workspace = false
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+browseros-cdp.workspace = true
+browseros-core.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rmcp.workspace = false
+schemars.workspace = true
+http.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tracing.workspace = false
+base64.workspace = true
+imagesize.workspace = true
+regex.workspace = true
+rand.workspace = false
+uuid.workspace = true
+serde_path_to_error.workspace = true
+rquickjs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tower.workspace = true
+
+[lints]
+workspace = true

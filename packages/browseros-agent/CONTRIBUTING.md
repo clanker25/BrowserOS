@@ -1,0 +1,201 @@
+# Contributing to BrowserOS neo
+
+The agent platform for [BrowserOS neo](../../README.md), the browser your agents drive. Start at the [root contributing guide](../../CONTRIBUTING.md) if you have not already, then come back here.
+
+## What you will be working on
+
+BrowserOS neo is two pieces that run together.
+
+| Project | What it is | Stack |
+|---|---|---|
+| [`apps/claw-app`](apps/claw-app/) | The cockpit. The new tab where you watch agents work, replay sessions, and manage connections | WXT + React extension, Tailwind v4, base-ui and Radix primitives, shadcn (base-vega), TanStack Query and Table, xyflow, Rive |
+| [`apps/claw-server`](apps/claw-server/) | The backend. The MCP endpoint agents connect to, plus the API behind the cockpit | Rust. axum for HTTP, sea-orm with migrations, rmcp for MCP, clap, posthog-rs |
+
+`claw-server` builds on shared crates in [`crates/`](crates/): `browseros-cdp` for Chrome DevTools Protocol bindings, `browseros-core` for primitives, `browseros-mcp` for the MCP server, `claw-api` for wire types, and `harness-integrations` for the managed AI coding harness integrations.
+
+The wire types are generated on both sides. [`packages/claw-api`](packages/claw-api/) holds the TypeScript DTOs and [`packages/claw-api-client`](packages/claw-api-client/) the contract-typed HTTP client, both generated from the same contract as the Rust `claw-api` crate. Do not hand edit generated files; run `bun run codegen:claw-api` instead.
+
+## Prerequisites
+
+| Tool | Why | Install |
+|---|---|---|
+| **Bun** | The package manager and runtime. Version pinned in `package.json` | `curl -fsSL https://bun.sh/install \| bash` |
+| **Node 22+** | Live browser tests and the Playwright corpus | [Node.js](https://nodejs.org/) |
+| **Go** | The dev supervisor is a Go program compiled on every run | `brew install go` |
+| **Rust** | `claw-server` is built and run with cargo | `brew install rustup && rustup-init` |
+| **BrowserOS neo** | The supervisor launches the installed app | [Download](https://cdn.browseros.com/download/BrowserOS_neo.dmg) |
+| **Docker** | Only if you change the API contract. `codegen:claw-api` runs the generator in a pinned container | [Docker Desktop](https://www.docker.com/products/docker-desktop/) |
+
+The interactive dev supervisor is macOS only today. The live-test launcher below supports macOS and Linux; Windows contributors can install dependencies and run checks without launching it.
+
+## Setup
+
+```bash
+cd packages/browseros-agent
+bun install
+cp .env.development.example .env.development
+```
+
+Everything in `.env.development` is optional for a first run. It holds analytics keys, Sentry DSNs, and port overrides, none of which you need to get the dev loop working. Copy it and move on.
+
+`bun run dev:setup` does the same install with a frozen lockfile, which is what CI does.
+
+## Run live browser tests
+
+When a test expects `BROWSEROS_CDP_PORT`, run its existing command through:
+
+```sh
+bun run test:browser -- cargo test -p neo-playwright --test evaluate_values_live -- --ignored
+```
+
+This starts a fresh headless Neo, waits for CDP, supplies the port, runs the command, and
+cleans up before returning its exit status. It preserves your command's arguments, working
+directory, home, and Cargo settings. Use an explicit shell for a sequence of commands:
+
+```sh
+bun run test:browser -- sh -c 'cargo test -p neo-playwright --test pages_live -- --ignored && cargo test -p neo-playwright --test evaluate_values_live -- --ignored'
+```
+
+Each invocation owns its browser, temporary profile, and browser home. The packaged server,
+updater, and extensions are disabled, so tests do not reconcile your MCP configuration or
+shared skills. Cancellation and launcher death trigger cleanup of the browser and command
+process groups. Logs and `result.json` remain at the artifact path printed to stderr. A test
+failure keeps its original exit code; launcher failures use 125, and interrupts use 130/143.
+
+The default browser is `/Applications/BrowserOS neo.app/Contents/MacOS/BrowserOS neo` on macOS
+and `browserclaw` on Linux. Set `NEO_E2E_BROWSER=/absolute/path/to/browser` for a different
+build. The helper selects its own unused port; do not start a browser or set a port first.
+
+Use this for standalone browser/CDP tests. `bun run test:neo-spec`, the server's browser tests
+(`apps/server/tests/__helpers__`), and the claw-mcp contract suite (`bun run test:claw-mcp-contract`)
+already own their browsers and should use their existing launchers. Full app development
+uses the watch command below. Tests should not share a running browser across agents:
+closing tabs or clearing cookies/cache in one suite can affect another.
+
+## Run it
+
+```bash
+bun run dev:claw:watch:new
+```
+
+That starts three processes and launches the browser against them:
+
+```
+apps/claw-app            wxt                        the cockpit, with hot reload
+apps/claw-app            bun run dev:web            the web preview
+apps/claw-server         cargo run -p claw-server
+```
+
+A file watcher also tracks `apps/claw-server/src`, its `Cargo.toml`, and its test fixtures, and restarts the Rust server whenever they change. The first cargo build takes a while; later ones are incremental.
+
+Stop everything with `bun run dev:stop`.
+
+Claw dev and dogfood modes leave the installed app's agent MCP configurations and shared
+skills alone, including in a release build. Connection settings remain readable, but
+Connect and Disconnect are disabled in dev. Locally authored skills stay in the dev
+instance without being published into agent directories.
+
+### SDK server
+
+```bash
+BROWSERCLAW_USE_SDK=1 bun run dev:claw:watch:new
+```
+
+This starts the dev browser and runs `neo-server` (`browseros-claw-sdk`) as its
+backend. The first Cargo build can take a few minutes. Changes to SDK Rust
+sources or embedded JavaScript assets restart the server. After editing the
+Playwright engine's TypeScript, run `bun run --filter @browseros/neo-playwright-js build`
+to update the watched assets.
+
+Wait for `neo-server ready: MCP at http://127.0.0.1:<port>/mcp`. Connect an MCP
+client to that URL to use the single `run` tool. To check it against the running
+browser, replace `<port>` with the logged server port:
+
+```bash
+python3 crates/neo-sdk/neo-server/docker/smoke_sdk.py --mcp-port <port>
+```
+
+The Claw UI still launches the browser. Its server-backed screens require
+claw-server's API, so use the MCP client to drive the browser in SDK mode.
+The SDK server logs that hosted mode is off because local popups open as
+separate windows. Unstamped browser builds report an unknown native version.
+Set `CLAW_NATIVE_BROWSEROS_VERSION` to your build's version to test features
+that require a specific browser version.
+
+Press Ctrl+C to stop the watch. Leave the flag unset for normal Claw
+development, or use it with `bun run dev:claw:watch` to keep the checkout's dev
+profile.
+
+### `:new` versus plain
+
+There are two variants and the difference matters more than the name suggests.
+
+| | `bun run dev:claw:watch` | `bun run dev:claw:watch:new` |
+|---|---|---|
+| Ports | Preferred: CDP 9000, server 9200, extension 9300 | Random, in the 9000 to 9999 range |
+| Browser profile | A persistent dev profile per checkout | A fresh temporary directory each run |
+| Claw state | `~/.browserclaw-dev`, shared across worktrees | A fresh `browserclaw-dev-*` directory in the system temp directory |
+| On start | **Kills anything holding those ports, and any browser already using that profile** | Only its own server port, cleared just before launch |
+| Reach for it when | You want your logins and settings to survive a restart | Running more than one at once, testing first-run behaviour, or not wanting to disturb a running instance |
+
+`:new` is the safer default while you are getting oriented, though it is not entirely hands-off: the server process clears its own port immediately before launching, so a process that grabs that port in the gap after it was picked will still be killed. Both variants lock the browser profile and the Claw state directory. Starting another watch with the same Claw state directory waits for its previous watcher to stop its children, even across worktrees. A shutdown timeout returns an error rather than reopening the same database during cleanup.
+
+Plain watch reuses Claw settings and session history across worktrees. To select another Claw state directory, set `BROWSERCLAW_DIR`; it takes precedence for both commands:
+
+```bash
+BROWSERCLAW_DIR=~/.browserclaw-copy-prod bun run dev:claw:watch
+```
+
+The supervisor logs the selected browser profile and Claw state directory at startup. `dev:cleanup` removes temporary directories, including those created by `:new`, and preserves `~/.browserclaw-dev` and other state outside the temp directories. `--only-temps` also stops watch owners before deleting their directories; it skips explicit port cleanup. Existing state nested inside an older browser profile is left in place; point `BROWSERCLAW_DIR` at it to resume it.
+
+## Before you open a PR
+
+```bash
+bun run check        # lint, typecheck and fallow
+bun test             # TypeScript suites
+bun run test:rust    # the Rust workspace
+bun run lint:rust    # clippy, warnings are errors
+bun run fmt:rust     # rustfmt check
+```
+
+Lint and formatting are Biome. `bun run lint:fix` applies what it can.
+
+If you changed the API contract, regenerate and commit the output:
+
+```bash
+bun run codegen:claw-api
+bun run test:claw-api-contract
+```
+
+## Handy extras
+
+| Command | What it does |
+|---|---|
+| `bun run dev:claw-onboard` | The onboarding flow on its own |
+| `bun run dev:reset` | Wipe the dev profile and start clean |
+| `bun run dev:cleanup` | Stop dev processes and free the ports |
+
+## Where things live
+
+```
+apps/
+  claw-app/              cockpit extension
+    entrypoints/         WXT entrypoints
+    screens/             one folder per screen
+    components/          shared UI
+    modules/             cross-cutting infrastructure
+    lib/                 utilities
+  claw-server/           Rust backend
+    src/
+    tests/
+  claw-onboard/          first-run onboarding (Vite)
+crates/                  shared Rust crates
+packages/                shared TypeScript packages
+tools/dev/               the Go dev supervisor
+```
+
+## Getting help
+
+[Discord](https://discord.gg/YKwjt5vuKr) · [Slack](https://dub.sh/browserOS-slack) · [Discussions](https://github.com/browseros-ai/BrowserOS/discussions)
+
+PR conventions, the CLA, and the browser build all live in the [root contributing guide](../../CONTRIBUTING.md).

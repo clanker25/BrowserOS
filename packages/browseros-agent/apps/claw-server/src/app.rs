@@ -1,0 +1,564 @@
+use crate::{
+    analytics::{AnalyticsService, AnalyticsSink},
+    api::{hosted, http},
+    config::Config,
+    db::{
+        AuditLog, DATABASE_FILENAME, Database, MigrationOutcome, RecordingIndex, SessionTabLedger,
+        SkillsRepository,
+    },
+    error::{AppError, AppResult},
+    runtime::ShutdownHandle,
+    services::{
+        agent_settings::AgentSettingsStore,
+        audit::AuditWorker,
+        browser::{BrowserService, TabRegistry},
+        capture::{CaptureHub, CdpPortTransport, LiveSessionTabs},
+        cockpit::{CockpitQuery, SessionVisualService, TabActivityRecord, TabActivityService},
+        harness::HarnessService,
+        harness_skills::{load_browserclaw_skill, with_ultrafast},
+        profiles::ProfileService,
+        recordings::{LiveRecordingBus, RecordingIngestService, RecordingStore},
+        replay::ReplayService,
+        screenshots::ScreenshotService,
+        session_efficiency::SessionEfficiencyService,
+        sessions::{Sessions, TargetBindings},
+        skill_runs::SkillRunService,
+        skills::SkillService,
+    },
+    storage::JsonStore,
+};
+use axum::{Router, middleware};
+use std::{env, ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<Config>,
+    pub audit_log: Arc<AuditLog>,
+    pub audit_worker: Arc<AuditWorker>,
+    pub audit_settings: Arc<crate::services::audit_settings::AuditSettingsStore>,
+    pub agent_settings: Arc<AgentSettingsStore>,
+    pub session_tabs: Arc<SessionTabLedger>,
+    pub recordings: Arc<RecordingStore>,
+    pub recording_ingest: Arc<RecordingIngestService>,
+    pub live_recordings: Arc<LiveRecordingBus>,
+    pub replay: Arc<ReplayService>,
+    pub screenshots: Arc<ScreenshotService>,
+    pub tab_activity: Arc<TabActivityService>,
+    pub tab_registry: Arc<TabRegistry>,
+    pub harness: Arc<HarnessService>,
+    pub skills: Arc<SkillService>,
+    pub skill_runs: Arc<SkillRunService>,
+    /// Read through `ultrafast_enabled`, which also keeps hosted servers out.
+    pub ultrafast: Arc<crate::services::flow::switch::UltrafastSwitch>,
+    /// Single-use answers to the "with your agent or without" question, minted per write flow.
+    pub consent_tokens: Arc<crate::services::flow::consent::ConsentTokens>,
+    pub analytics: Arc<AnalyticsService>,
+    pub error_reporter: Arc<crate::services::error_reporting::ErrorReporter>,
+    pub feedback_cohort: Arc<crate::services::feedback_cohort::FeedbackCohort>,
+    pub feedback_invites: Arc<crate::db::feedback_invite::FeedbackInviteRepository>,
+    pub tool_calls_daily: Arc<crate::db::tool_calls_daily::ToolCallsDailyRepository>,
+    /// What ultrafast did in each task, kept after the task's history is deleted.
+    pub ultrafast_ledger: Arc<crate::db::ultrafast_ledger::UltrafastLedger>,
+    pub profiles: Arc<ProfileService>,
+    pub sessions: Arc<Sessions>,
+    /// Saved native-profile intent is separate from agent profiles and live browser state.
+    pub targets: Arc<TargetBindings>,
+    pub session_efficiency: Arc<SessionEfficiencyService>,
+    pub browser: Arc<BrowserService>,
+    pub captcha: Option<Arc<crate::services::captcha::CaptchaService>>,
+    /// Per-tab viewport modes; hosted only, so desktop page geometry is never touched.
+    pub viewports: Option<Arc<browseros_core::viewport::Viewports>>,
+    pub visuals: Arc<SessionVisualService>,
+    /// Live screencast and video of session tabs for the hosted `/v1` API; idle (no browser
+    /// connection, no captures) until someone watches.
+    pub capture: Arc<CaptureHub>,
+    pub cockpit: Arc<CockpitQuery>,
+    pub help: Arc<crate::services::help::HelpRegistry>,
+    pub claude_desktop: Arc<crate::services::claude_desktop::ClaudeDesktop>,
+    pub extension_updates: Arc<crate::services::extension_updates::ExtensionUpdates>,
+    /// ultrafast. Without a billing gateway in this build it reads as no plan and refuses the rest.
+    pub billing: Arc<crate::services::billing::Billing>,
+    /// The decisions worker pursue reaches the decision model and the writer through.
+    pub decisions: Arc<crate::services::decisions::Decisions>,
+    /// Where a release build reads whether ultrafast is on sale; `None` sells without asking.
+    pub plan_offer: Option<crate::services::plan_offer::FlagSource>,
+    pub shutdown: ShutdownHandle,
+    /// How the data this server opened compares to the schema this build knows, published on
+    /// `/system/info` so the app can prompt an update when the database is ahead of the server.
+    pub migration: MigrationOutcome,
+}
+
+pub use crate::services::billing::ULTRAFAST_FEATURE;
+
+/// Overall cap on how long a human-help request stays open before it is reaped, so a crashed or
+/// non-looping agent never leaves a stale "needs you" request behind.
+const HELP_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+impl AppState {
+    /// The server's state, with the billing gateway this build compiles in.
+    pub async fn new(config: Arc<Config>) -> AppResult<Self> {
+        let home = resolve_user_home_with(|name| env::var_os(name))?;
+        // A hosted server is infrastructure with no person at it to buy or paste a key.
+        let billing = (!config.mode.is_hosted())
+            .then(|| crate::services::billing::BillingConfig::for_build(config.dev_mode))
+            .flatten();
+        let mut state = Self::new_with_home_and_billing(config, home, billing).await?;
+        if state.billing.is_available()
+            && crate::services::plan_offer::sells_behind_flag(state.config.dev_mode)
+        {
+            // Closed until PostHog says otherwise, or the last answer this computer saved.
+            let offered =
+                crate::services::plan_offer::load_cached(&state.config.browserclaw_dir).await;
+            state.billing.set_offered(offered.unwrap_or(false));
+            state.plan_offer = crate::services::plan_offer::flag_source(
+                state.config.mode,
+                state.config.dev_mode,
+                state.analytics.remote_config_credentials(),
+            );
+        }
+        Ok(state)
+    }
+
+    /// State under another home with no billing gateway, so a test never reaches a real one.
+    /// Tests that need a gateway pass a local one to [`Self::new_with_home_and_billing`].
+    pub async fn new_with_home(config: Arc<Config>, home_dir: PathBuf) -> AppResult<Self> {
+        Self::new_with_home_and_billing(config, home_dir, None).await
+    }
+
+    pub async fn new_with_home_and_billing(
+        config: Arc<Config>,
+        home_dir: PathBuf,
+        billing_config: Option<crate::services::billing::BillingConfig>,
+    ) -> AppResult<Self> {
+        tokio::fs::create_dir_all(&config.browserclaw_dir).await?;
+        let store = JsonStore::new(config.browserclaw_dir.clone());
+        let targets = TargetBindings::load(store.clone()).await?;
+        let database = Database::open(config.browserclaw_dir.join(DATABASE_FILENAME)).await?;
+        let migration = database.migration_outcome().clone();
+        let audit_log = Arc::new(AuditLog::new(database.clone()));
+        let audit_settings = Arc::new(
+            crate::services::audit_settings::AuditSettingsStore::new(&config.browserclaw_dir).await,
+        );
+        let agent_settings = Arc::new(AgentSettingsStore::load(store.clone()).await);
+        let session_tabs = Arc::new(SessionTabLedger::new(database.clone()));
+        let recording_index = Arc::new(RecordingIndex::new(database.clone()));
+        session_tabs.release_all_open().await?;
+        let recordings = RecordingStore::new(
+            config.browserclaw_dir.join("recordings"),
+            config.browserclaw_dir.join("replays"),
+            recording_index.clone(),
+            50,
+            Duration::from_secs(30),
+        );
+        let replay = ReplayService::new(recordings.clone(), recording_index);
+        let screenshots = Arc::new(ScreenshotService::new(
+            config.browserclaw_dir.join("screenshots"),
+            audit_log.clone(),
+        ));
+        let analytics =
+            Arc::new(AnalyticsService::new(&config.browserclaw_dir, config.mode).await?);
+        let analytics_sink: Arc<dyn AnalyticsSink> = analytics.clone();
+        // Shares the analytics install id, so a failure report and a product event are
+        // the same anonymous install and neither adds a new identifier.
+        let error_reporter = Arc::new(crate::services::error_reporting::ErrorReporter::from_env(
+            crate::db::run_error_budget::RunErrorBudgetRepository::new(database.clone()),
+            analytics.get_state().await.distinct_id,
+            &config.browserclaw_dir.join("logs"),
+        ));
+        let feedback_cohort = Arc::new(crate::services::feedback_cohort::FeedbackCohort::new());
+        let feedback_invites = Arc::new(crate::db::feedback_invite::FeedbackInviteRepository::new(
+            database.clone(),
+        ));
+        let tool_calls_daily = Arc::new(
+            crate::db::tool_calls_daily::ToolCallsDailyRepository::new(database.clone()),
+        );
+        let ultrafast_ledger = Arc::new(crate::db::ultrafast_ledger::UltrafastLedger::new(
+            database.clone(),
+        ));
+        let skill = load_browserclaw_skill(&config.resources_dir, config.behavior.tab_grouping)?;
+        let ultrafast_skill = with_ultrafast(&skill)?;
+        let claude_desktop = Arc::new(crate::services::claude_desktop::ClaudeDesktop::new(
+            &home_dir,
+            config.browserclaw_dir.join("claude-desktop"),
+        ));
+        let harness = Arc::new(
+            HarnessService::new_with_managed_skill(
+                config.browserclaw_dir.join("mcp-manager"),
+                config.browserclaw_dir.join("harness-integrations"),
+                home_dir,
+                skill,
+                analytics_sink.clone(),
+            )
+            .with_ultrafast_skill(ultrafast_skill)
+            .with_read_only(config.dev_mode),
+        );
+        let skills = Arc::new(SkillService::new(
+            SkillsRepository::new(database.clone()),
+            harness.clone(),
+            config.browserclaw_dir.join("skills"),
+        ));
+        let skill_runs = Arc::new(SkillRunService::new(
+            SkillsRepository::new(database.clone()),
+            audit_log.clone(),
+        ));
+        let profiles = Arc::new(ProfileService::new(store.clone()));
+        let session_efficiency = Arc::new(SessionEfficiencyService::new_with_analytics(
+            database,
+            analytics_sink.clone(),
+        ));
+        let sessions = Sessions::new_with_analytics(
+            audit_log.clone(),
+            session_tabs.clone(),
+            config.session_idle,
+            config.session_complete_idle,
+            config.session_retention,
+            config.session_sweep_interval,
+            analytics_sink,
+        );
+        sessions.set_target_bindings(targets.clone());
+        sessions.set_completion_hook(Arc::new({
+            let session_efficiency = session_efficiency.clone();
+            let skill_runs = skill_runs.clone();
+            move |session_id| {
+                skill_runs.spawn_finalize(session_id.clone());
+                let _ = session_efficiency.queue_finalize(session_id);
+            }
+        }));
+        let tab_registry = TabRegistry::new(session_tabs.clone());
+        let browser = BrowserService::new(
+            config.cdp_port,
+            sessions.ownership(),
+            tab_registry.clone(),
+            config.native.capabilities,
+        );
+        let live_recordings = LiveRecordingBus::new();
+        let recording_ingest = RecordingIngestService::new(
+            recordings.clone(),
+            browser.clone(),
+            tab_registry.clone(),
+            live_recordings.clone(),
+        );
+        let tab_activity = Arc::new(TabActivityService::default());
+        let viewports = config
+            .mode
+            .is_hosted()
+            .then(|| Arc::new(browseros_core::viewport::Viewports::default()));
+        let visuals = SessionVisualService::new(
+            sessions.clone(),
+            session_tabs.clone(),
+            browser.clone(),
+            tab_activity.clone(),
+            viewports.clone(),
+        );
+        let shutdown = ShutdownHandle::new();
+        let capture = CaptureHub::new(
+            Arc::new(LiveSessionTabs::new(
+                sessions.clone(),
+                audit_log.clone(),
+                visuals.clone(),
+            )),
+            Arc::new(CdpPortTransport::new(config.cdp_port)),
+            shutdown.child_token(),
+        );
+        let audit_worker = AuditWorker::new(audit_log.clone());
+        sessions.set_audit_flush_hook(Arc::new({
+            let audit_worker = Arc::downgrade(&audit_worker);
+            move |session_id| {
+                let audit_worker = audit_worker.clone();
+                Box::pin(async move {
+                    let audit_worker = audit_worker.upgrade().ok_or_else(|| {
+                        AppError::Internal(
+                            "audit worker unavailable during session flush".to_string(),
+                        )
+                    })?;
+                    audit_worker.flush_session(&session_id).await
+                })
+            }
+        }));
+        let cockpit = Arc::new(CockpitQuery::new(
+            sessions.clone(),
+            profiles.clone(),
+            audit_log.clone(),
+            session_tabs.clone(),
+            browser.clone(),
+            tab_activity.clone(),
+        ));
+        let captcha = crate::services::captcha::CaptchaService::from_env(config.mode);
+        let billing = Arc::new(
+            crate::services::billing::Billing::open(
+                billing_config,
+                config.browserclaw_dir.clone(),
+                shutdown.child_token(),
+            )
+            .await,
+        );
+        let decisions = Arc::new(crate::services::decisions::Decisions::for_build(
+            config.mode.is_hosted(),
+        ));
+        Ok(Self {
+            config,
+            audit_log,
+            audit_worker,
+            audit_settings,
+            agent_settings,
+            session_tabs,
+            recordings,
+            recording_ingest,
+            live_recordings,
+            replay,
+            screenshots,
+            tab_activity,
+            tab_registry,
+            harness,
+            skills,
+            skill_runs,
+            ultrafast: Arc::default(),
+            consent_tokens: Arc::default(),
+            analytics,
+            error_reporter,
+            feedback_cohort,
+            feedback_invites,
+            tool_calls_daily,
+            ultrafast_ledger,
+            profiles,
+            sessions,
+            targets,
+            session_efficiency,
+            browser,
+            captcha,
+            viewports,
+            visuals,
+            capture,
+            cockpit,
+            help: Arc::new(crate::services::help::HelpRegistry::new(HELP_MAX_WAIT)),
+            claude_desktop,
+            extension_updates: Arc::default(),
+            billing,
+            decisions,
+            plan_offer: None,
+            shutdown,
+            migration,
+        })
+    }
+
+    /// Whether saved skills compile into ultrafast flows. Off by default, so skills save and run
+    /// the regular way; hosted servers never offer them.
+    #[must_use]
+    pub fn ultrafast_enabled(&self) -> bool {
+        self.ultrafast.is_on() && !self.config.mode.is_hosted()
+    }
+
+    /// Follows the plan: ultrafast is on while it includes it. When that changes, SKILL.md files
+    /// and the guide installed in connected agents follow, and those agents hear about it through
+    /// their tool list. Returns whether it changed.
+    pub async fn sync_ultrafast_with_plan(&self) -> bool {
+        let on = !self.config.mode.is_hosted() && self.billing.has_feature(ULTRAFAST_FEATURE).await;
+        let changed = self.ultrafast.set(on);
+        // Outside the change check: a switch pinned on at startup never reports a change, and the
+        // guide only re-installs when its own state moves.
+        if let Err(error) = self
+            .harness
+            .set_ultrafast_skill(self.ultrafast_enabled())
+            .await
+        {
+            tracing::warn!(error = %error, "agent guide sync failed");
+        }
+        // Outside the change check too, so a switch already on at startup still gets its date.
+        if let Err(error) = self.record_ultrafast_start().await {
+            tracing::warn!(error = %error, "ultrafast start date not saved");
+        }
+        if !changed {
+            return false;
+        }
+        if let Err(error) = self.skills.sync_skill_md(self.ultrafast_enabled()).await {
+            tracing::warn!(error = %error, "skill file sync failed");
+        }
+        true
+    }
+
+    /// Saves the day this computer got ultrafast, the first time the switch is on: the earlier of
+    /// now and the first ultrafast run, so a computer that used it before keeps those savings.
+    async fn record_ultrafast_start(&self) -> AppResult<()> {
+        if !self.ultrafast_enabled() {
+            return Ok(());
+        }
+        let store = JsonStore::new(self.config.browserclaw_dir.clone());
+        if crate::services::ultrafast_meter::saved_since(&store)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let history = self.audit_log.all_ultrafast_sessions().await?;
+        let kept = self.ultrafast_ledger.all().await?;
+        let first_run = history
+            .iter()
+            .map(|session| session.first_run_at)
+            .chain(kept.iter().map(|record| record.first_run_at))
+            .min();
+        crate::services::ultrafast_meter::since(
+            &store,
+            true,
+            first_run,
+            crate::clock::now_epoch_ms(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn live_tab_activity(&self) -> Vec<TabActivityRecord> {
+        let session = self.browser.session().await;
+        self.tab_activity.snapshot(session.as_deref()).await
+    }
+
+    /// Reports one-time startup conditions worth seeing remotely. Right now that is the database
+    /// having been migrated by a newer BrowserOS neo (read-forward), which the server survives but
+    /// which signals a version skew the user should resolve by updating. Consent-gated and drawn
+    /// from the shared daily budget, so it cannot exceed the cap or report without consent.
+    pub async fn report_startup_state(&self) {
+        let MigrationOutcome::DatabaseAhead { unknown } = &self.migration else {
+            return;
+        };
+        let consent = self.analytics.get_state().await.consent;
+        self.error_reporter
+            .report_error(
+                consent,
+                "startup",
+                "database_ahead".to_string(),
+                Some(unknown.join(",")),
+                crate::clock::now_epoch_ms(),
+            )
+            .await;
+    }
+}
+
+fn resolve_user_home_with(mut lookup: impl FnMut(&str) -> Option<OsString>) -> AppResult<PathBuf> {
+    for variable in ["HOME", "USERPROFILE"] {
+        if let Some(value) = lookup(variable).filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(value));
+        }
+    }
+    Err(AppError::Internal(
+        "Cannot resolve the user home directory because neither HOME nor USERPROFILE is set"
+            .to_string(),
+    ))
+}
+
+pub fn build_router(state: AppState) -> Router {
+    let mut router = http::router(state.clone());
+    // `/v1` is the hosted API: published to the backend that runs a hosted neo, and absent on
+    // desktop, where a person is at the browser and the cockpit is the way in.
+    if state.config.mode.is_hosted() {
+        router = router.merge(hosted::router());
+    }
+    router
+        .with_state(state)
+        .layer(middleware::from_fn(http::request_context))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppState, resolve_user_home_with};
+    use crate::{config::Config, db::DATABASE_FILENAME};
+    use std::{collections::BTreeMap, ffi::OsString, sync::Arc, time::Duration};
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn new_with_home_uses_browserclaw_database_without_touching_old_file()
+    -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let browserclaw_dir = dir.path().join("browserclaw");
+        tokio::fs::create_dir_all(&browserclaw_dir).await?;
+        let old_database = browserclaw_dir.join("audit.sqlite");
+        let old_contents = b"old database stays untouched";
+        tokio::fs::write(&old_database, old_contents).await?;
+        let config = Arc::new(Config {
+            server_port: 9200,
+            cdp_port: 49337,
+            proxy_port: None,
+            resources_dir: dir.path().join("resources"),
+            browserclaw_dir: browserclaw_dir.clone(),
+            session_idle: Duration::from_secs(300),
+            session_complete_idle: Duration::from_secs(300),
+            session_retention: Duration::from_secs(7_200),
+            session_sweep_interval: Duration::from_secs(60),
+            replay_retention_days: 7,
+            dev_mode: false,
+            native: Default::default(),
+            mode: Default::default(),
+            behavior: Default::default(),
+            behavior_ignored: Vec::new(),
+        });
+
+        let state = AppState::new_with_home(config, dir.path().join("home")).await?;
+        assert!(state.captcha.is_none());
+
+        assert_eq!(DATABASE_FILENAME, "browserclaw.sqlite");
+        assert!(browserclaw_dir.join(DATABASE_FILENAME).is_file());
+        assert_eq!(tokio::fs::read(old_database).await?, old_contents);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_test_app_has_no_billing_gateway_in_any_build() -> anyhow::Result<()> {
+        for dev_mode in [false, true] {
+            let dir = tempdir()?;
+            let config = Arc::new(Config {
+                server_port: 9200,
+                cdp_port: 49337,
+                proxy_port: None,
+                resources_dir: dir.path().join("resources"),
+                browserclaw_dir: dir.path().join("browserclaw"),
+                session_idle: Duration::from_secs(300),
+                session_complete_idle: Duration::from_secs(300),
+                session_retention: Duration::from_secs(7_200),
+                session_sweep_interval: Duration::from_secs(60),
+                replay_retention_days: 7,
+                dev_mode,
+                native: Default::default(),
+                mode: Default::default(),
+                behavior: Default::default(),
+                behavior_ignored: Vec::new(),
+            });
+            let state = AppState::new_with_home(config, dir.path().join("home")).await?;
+            assert!(!state.billing.is_available(), "dev_mode {dev_mode}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn harness_skills_home_resolution_prefers_home_then_userprofile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let unix = BTreeMap::from([
+            ("HOME", OsString::from("/users/unix")),
+            ("USERPROFILE", OsString::from("C:\\Users\\windows")),
+        ]);
+        assert_eq!(
+            resolve_user_home_with(|name| unix.get(name).cloned())?,
+            std::path::PathBuf::from("/users/unix")
+        );
+
+        let windows = BTreeMap::from([("USERPROFILE", OsString::from("C:\\Users\\windows"))]);
+        assert_eq!(
+            resolve_user_home_with(|name| windows.get(name).cloned())?,
+            std::path::PathBuf::from("C:\\Users\\windows")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn harness_skills_home_resolution_rejects_missing_or_empty_variables() {
+        let error = resolve_user_home_with(|name| match name {
+            "HOME" => Some(OsString::new()),
+            _ => None,
+        })
+        .err()
+        .map(|error| error.to_string());
+        assert_eq!(
+            error.as_deref(),
+            Some(
+                "Cannot resolve the user home directory because neither HOME nor USERPROFILE is set"
+            )
+        );
+    }
+}

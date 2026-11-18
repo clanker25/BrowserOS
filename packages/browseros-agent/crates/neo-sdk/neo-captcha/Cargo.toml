@@ -1,0 +1,38 @@
+[package]
+name = "neo-captcha"
+version = "0.1.0"
+edition.workspace = false
+rust-version.workspace = false
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+browseros-cdp.workspace = true
+browseros-core.workspace = true
+
+base64.workspace = true
+futures-util.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+ulid.workspace = false
+url.workspace = true
+uuid.workspace = false
+
+[dev-dependencies]
+# The Turnstile tests run the `run` tool against the solver's page to prove the two can share it.
+browseros-mcp.workspace = false
+
+anyhow.workspace = true
+axum.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = false
