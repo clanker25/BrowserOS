@@ -1,0 +1,6 @@
+{
+  "harness": "Codex",
+  "installed": false,
+  "configPath": "~/.codex/config.toml",
+  "message": "Configured in Codex."
+}

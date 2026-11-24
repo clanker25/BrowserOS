@@ -1,0 +1,927 @@
+//! Exercises public dispatch against real loopback discovery and WebSocket peers.
+//! The fixture controls lock admission inside the transport only to force an
+//! otherwise narrow reconnect race; mutation evidence comes from the peer.
+
+use super::*;
+use crate::alloc_count;
+use futures_util::poll;
+use std::{future::poll_fn, task::Poll};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    task::JoinSet,
+};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+/// Each accepted socket represents a fresh browser with the same window ID.
+/// Servers belong to the test runtime and are aborted together on fixture drop.
+struct LoopbackBrowser {
+    discovery_port: u16,
+    discovery_task: JoinHandle<()>,
+    websocket_task: JoinHandle<()>,
+}
+
+impl LoopbackBrowser {
+    async fn start() -> Self {
+        let websocket_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|err| panic!("bind websocket: {err}"));
+        let websocket_port = websocket_listener
+            .local_addr()
+            .unwrap_or_else(|err| panic!("websocket address: {err}"))
+            .port();
+        let websocket_task = tokio::spawn(async move {
+            // Dropping this set also cancels accepted peers when the listener
+            // task is aborted, including peers left open by a failed assertion.
+            let mut peers = JoinSet::new();
+            loop {
+                let (stream, _) = websocket_listener
+                    .accept()
+                    .await
+                    .unwrap_or_else(|err| panic!("accept websocket: {err}"));
+                peers.spawn(serve_browser(stream));
+            }
+        });
+
+        let discovery_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|err| panic!("bind discovery: {err}"));
+        let discovery_port = discovery_listener
+            .local_addr()
+            .unwrap_or_else(|err| panic!("discovery address: {err}"))
+            .port();
+        let discovery_task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = discovery_listener
+                    .accept()
+                    .await
+                    .unwrap_or_else(|err| panic!("accept discovery: {err}"));
+                let mut request = Vec::new();
+                let mut scratch = [0_u8; 1024];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let read = stream
+                        .read(&mut scratch)
+                        .await
+                        .unwrap_or_else(|err| panic!("read discovery: {err}"));
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&scratch[..read]);
+                }
+                let body = format!(
+                    "{{\"webSocketDebuggerUrl\":\"ws://127.0.0.1:{websocket_port}/devtools/browser/test\"}}"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap_or_else(|err| panic!("write discovery: {err}"));
+            }
+        });
+        Self {
+            discovery_port,
+            discovery_task,
+            websocket_task,
+        }
+    }
+
+    async fn connect(&self) -> CdpClient {
+        CdpClient::connect(ConnectOptions {
+            host: Some("127.0.0.1".to_string()),
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(2),
+            // The test drives the production reopen path explicitly, so neither
+            // keepalive traffic nor a supervisor retry can alter its schedule.
+            keepalive_interval: Duration::from_secs(3600),
+            reconnect_delay: Duration::from_secs(3600),
+            link_check_interval: Duration::from_secs(3600),
+            reconnect_policy: ReconnectPolicy::KeepTrying,
+            ..ConnectOptions::new(self.discovery_port)
+        })
+        .await
+        .unwrap_or_else(|err| panic!("connect loopback browser: {err}"))
+    }
+}
+
+impl Drop for LoopbackBrowser {
+    fn drop(&mut self) {
+        self.discovery_task.abort();
+        self.websocket_task.abort();
+    }
+}
+
+async fn serve_browser(stream: TcpStream) {
+    let mut socket = tokio_tungstenite::accept_async(stream)
+        .await
+        .unwrap_or_else(|err| panic!("accept upgrade: {err}"));
+    let mut mutations = 0_u64;
+    let mut window_open = true;
+    while let Some(Ok(message)) = socket.next().await {
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let request: Value = serde_json::from_str(text.as_str())
+            .unwrap_or_else(|err| panic!("parse request: {err}"));
+        let result = match request["method"].as_str() {
+            Some("Browser.closeWindow") => {
+                assert_eq!(request["params"]["windowId"], 7);
+                mutations += 1;
+                window_open = false;
+                json!({})
+            }
+            Some("Browser.getWindows") => json!({
+                "windows": if window_open { json!([{ "windowId": 7 }]) } else { json!([]) },
+                "mutations": mutations,
+            }),
+            Some("Fixture.echo") => json!({
+                "params": request["params"],
+                "sessionId": request["sessionId"],
+                "frame": text.as_str(),
+            }),
+            // Never answered, like an evaluation whose promise never settles.
+            Some("Fixture.never") => continue,
+            // Answers with the exact text the params give, `{id}` replaced by the request's id,
+            // as Chromium writes a reply serde cannot read.
+            Some("Fixture.answer_raw") => {
+                let reply = request["params"]["text"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("answer_raw needs text"))
+                    .replace("{id}", &request["id"].to_string());
+                if socket.send(Message::Text(reply.into())).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            // Sends the exact text the params give ahead of the reply.
+            Some("Fixture.emit_raw") => {
+                let text = request["params"]["text"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("emit_raw needs text"))
+                    .to_owned();
+                if socket.send(Message::Text(text.into())).await.is_err() {
+                    return;
+                }
+                json!({})
+            }
+            // Closes the socket with the params' code and reason, or with no status at all.
+            Some("Fixture.close") => {
+                let frame = request["params"]["code"].as_u64().map(|code| CloseFrame {
+                    code: CloseCode::from(u16::try_from(code).unwrap_or(1000)),
+                    reason: request["params"]["reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                        .into(),
+                });
+                let _ = socket.close(frame).await;
+                return;
+            }
+            // Sends the event the params describe ahead of the reply, so the client's reader
+            // has routed it by the time the request resolves.
+            Some("Fixture.emit") => {
+                let event = json!({
+                    "method": request["params"]["method"],
+                    "params": request["params"]["params"],
+                });
+                if socket
+                    .send(Message::Text(event.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                json!({})
+            }
+            _ => panic!("unexpected method: {}", request["method"]),
+        };
+        let response = json!({ "id": request["id"], "result": result });
+        if socket
+            .send(Message::Text(response.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+async fn assert_replacement_untouched(
+    client: &CdpClient,
+    result: Result<Value, CdpError>,
+    expected_epoch: u64,
+) {
+    // This response is an ordered fence after the paused request. Checking the
+    // replacement's state after it replies proves absence of mutation without
+    // relying on a sleep or on whether a request happened to be logged yet.
+    let state = client
+        .send("Browser.getWindows", json!({}), None)
+        .await
+        .unwrap_or_else(|err| panic!("query replacement state: {err}"));
+    assert_eq!(state["mutations"], 0, "stale dispatch mutated replacement");
+    assert_eq!(state["windows"], json!([{ "windowId": 7 }]));
+    assert_eq!(
+        result,
+        Err(CdpError::ConnectionEpochChanged {
+            expected: expected_epoch,
+            actual: expected_epoch + 1,
+        })
+    );
+}
+
+#[derive(Clone, Copy)]
+enum Encoding {
+    Value,
+    Raw,
+}
+
+impl Encoding {
+    async fn close_window(
+        self,
+        client: &CdpClient,
+        epoch: u64,
+        session: Option<&SessionId>,
+    ) -> Result<Value, CdpError> {
+        match self {
+            Self::Value => {
+                client
+                    .send_at_epoch(
+                        epoch,
+                        "Browser.closeWindow",
+                        json!({ "windowId": 7 }),
+                        session,
+                    )
+                    .await
+            }
+            Self::Raw => {
+                let response = client
+                    .send_raw_json_at_epoch(
+                        epoch,
+                        "Browser.closeWindow",
+                        r#"{ "windowId": 7 }"#,
+                        session,
+                    )
+                    .await?;
+                serde_json::from_str(&response).map_err(CdpError::from)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DispatchWait {
+    PendingMap,
+    Socket,
+}
+
+async fn rejects_paused_dispatch(encoding: Encoding, wait: DispatchWait) {
+    // Session IDs may also be reused by a replacement. Cover both browser-root
+    // and session-routed frames without giving either encoder a separate guard.
+    for session in [None, Some(SessionId::from("reused-session"))] {
+        let browser = LoopbackBrowser::start().await;
+        let client = browser.connect().await;
+        let epoch = client.epoch();
+        let mut request = Box::pin(encoding.close_window(&client, epoch, session.as_ref()));
+
+        match wait {
+            DispatchWait::PendingMap => {
+                let pending_guard = client.inner.pending.lock().await;
+                // Polling once enters the public API and suspends at the held
+                // pending-map lock. The real reopen can now overtake dispatch.
+                assert!(poll!(request.as_mut()).is_pending());
+                timeout(Duration::from_secs(2), open_socket(client.inner.clone()))
+                    .await
+                    .unwrap_or_else(|err| panic!("reopen timed out: {err}"))
+                    .unwrap_or_else(|err| panic!("reopen failed: {err}"));
+                drop(pending_guard);
+            }
+            DispatchWait::Socket => {
+                let sink_guard = client.inner.sink.lock().await;
+                let mut reopen = Box::pin(open_socket(client.inner.clone()));
+                // Drive discovery/upgrade until publication queues on the held
+                // sink guard. Taking the old reader precedes that await, and no
+                // other await lies between them. Manual polling on this single
+                // thread makes FIFO mutex admission deterministic, without sleeps
+                // or a production test hook.
+                timeout(
+                    Duration::from_secs(2),
+                    poll_fn(|cx| {
+                        if let Poll::Ready(result) = reopen.as_mut().poll(cx) {
+                            panic!("reopen should wait for held sink: {result:?}");
+                        }
+                        if client
+                            .inner
+                            .reader_task
+                            .try_lock()
+                            .is_ok_and(|reader| reader.is_none())
+                        {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    }),
+                )
+                .await
+                .unwrap_or_else(|err| panic!("publication did not queue: {err}"));
+                // Dispatch queues after publication, so it selects the new sink
+                // despite having entered with IDs resolved on the old socket.
+                assert!(poll!(request.as_mut()).is_pending());
+                drop(sink_guard);
+                reopen
+                    .await
+                    .unwrap_or_else(|err| panic!("reopen failed: {err}"));
+            }
+        }
+
+        let result = request.await;
+        assert_replacement_untouched(&client, result, epoch).await;
+        client.disconnect().await;
+    }
+}
+
+#[tokio::test]
+async fn bound_dispatch_waiting_for_pending_map_cannot_mutate_replacement() {
+    rejects_paused_dispatch(Encoding::Value, DispatchWait::PendingMap).await;
+}
+
+#[tokio::test]
+async fn bound_raw_dispatch_waiting_for_pending_map_cannot_mutate_replacement() {
+    rejects_paused_dispatch(Encoding::Raw, DispatchWait::PendingMap).await;
+}
+
+#[tokio::test]
+async fn bound_dispatch_waiting_for_socket_cannot_mutate_replacement() {
+    rejects_paused_dispatch(Encoding::Value, DispatchWait::Socket).await;
+}
+
+#[tokio::test]
+async fn bound_raw_dispatch_waiting_for_socket_cannot_mutate_replacement() {
+    rejects_paused_dispatch(Encoding::Raw, DispatchWait::Socket).await;
+}
+
+#[tokio::test]
+async fn bound_and_unbound_sends_preserve_parameters_and_session_routing() {
+    let browser = LoopbackBrowser::start().await;
+    let client = browser.connect().await;
+    let session = SessionId::from("session\"\\");
+    let params = json!({ "windowId": 7, "nested": [true, "value"] });
+
+    for bound in [false, true] {
+        let response = if bound {
+            client
+                .send_at_epoch(
+                    client.epoch(),
+                    "Fixture.echo",
+                    params.clone(),
+                    Some(&session),
+                )
+                .await
+        } else {
+            client
+                .send("Fixture.echo", params.clone(), Some(&session))
+                .await
+        }
+        .unwrap_or_else(|err| panic!("send value parameters: {err}"));
+        assert_eq!(response["params"], params);
+        assert_eq!(response["sessionId"], session.as_str());
+
+        // Duplicate keys and whitespace expose accidental parse/reserialize of
+        // raw parameters, independently of the peer's parsed parameter value.
+        let raw_params = r#"{ "windowId": 7, "duplicate": 1, "duplicate": 2 }"#;
+        let response = if bound {
+            client
+                .send_raw_json_at_epoch(client.epoch(), "Fixture.echo", raw_params, Some(&session))
+                .await
+        } else {
+            client
+                .send_raw_json("Fixture.echo", raw_params, Some(&session))
+                .await
+        }
+        .unwrap_or_else(|err| panic!("send raw parameters: {err}"));
+        let response: Value = serde_json::from_str(&response)
+            .unwrap_or_else(|err| panic!("parse echo response: {err}"));
+        assert_eq!(response["sessionId"], session.as_str());
+        assert!(
+            response["frame"]
+                .as_str()
+                .is_some_and(|frame| frame.contains(&format!("\"params\":{raw_params}")))
+        );
+    }
+    client.disconnect().await;
+}
+
+#[tokio::test]
+async fn bound_sends_on_a_disconnected_current_epoch_are_not_connected() {
+    let browser = LoopbackBrowser::start().await;
+    let client = browser.connect().await;
+    let epoch = client.epoch();
+    client.disconnect().await;
+
+    for encoding in [Encoding::Value, Encoding::Raw] {
+        assert_eq!(
+            encoding.close_window(&client, epoch, None).await,
+            Err(CdpError::NotConnected)
+        );
+    }
+}
+
+#[tokio::test]
+async fn bound_raw_send_rejects_invalid_parameters_without_mutation() {
+    let browser = LoopbackBrowser::start().await;
+    let client = browser.connect().await;
+    let result = client
+        .send_raw_json_at_epoch(client.epoch(), "Browser.closeWindow", "{", None)
+        .await;
+    assert!(matches!(result, Err(CdpError::Json(_))));
+    let state = client
+        .send("Browser.getWindows", json!({}), None)
+        .await
+        .unwrap_or_else(|err| panic!("query browser state: {err}"));
+    assert_eq!(state["mutations"], 0);
+    client.disconnect().await;
+}
+
+#[tokio::test]
+async fn a_send_its_caller_abandons_frees_its_reply_slot() {
+    let browser = LoopbackBrowser::start().await;
+    let client = browser.connect().await;
+    // The caller gives up long before the client's own two-second request timeout.
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(100),
+        client.send("Fixture.never", json!({}), None),
+    )
+    .await;
+    assert!(abandoned.is_err(), "the peer never answers");
+    let mut freed = false;
+    for _ in 0..50 {
+        if client.inner.pending.lock().await.is_empty() {
+            freed = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(freed, "an abandoned request kept its reply slot");
+    client.disconnect().await;
+}
+
+#[tokio::test]
+async fn a_detached_sessions_unanswered_requests_fail_as_gone_and_others_wait() {
+    let browser = LoopbackBrowser::start().await;
+    let client = browser.connect().await;
+    let gone = SessionId::from("detached-frame");
+    let live = SessionId::from("live-frame");
+    let on_gone = tokio::spawn({
+        let client = client.clone();
+        async move { client.send("Fixture.never", json!({}), Some(&gone)).await }
+    });
+    let on_live = tokio::spawn({
+        let client = client.clone();
+        async move { client.send("Fixture.never", json!({}), Some(&live)).await }
+    });
+    let mut both_pending = false;
+    for _ in 0..50 {
+        if client.inner.pending.lock().await.len() == 2 {
+            both_pending = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(both_pending, "both requests were sent");
+    client
+        .send(
+            "Fixture.emit",
+            json!({
+                "method": "Target.detachedFromTarget",
+                "params": { "sessionId": "detached-frame" },
+            }),
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("emit the detach: {err}"));
+    // Well inside the client's two-second request timeout.
+    let failed = timeout(Duration::from_millis(500), on_gone)
+        .await
+        .unwrap_or_else(|_elapsed| panic!("the detached session's request still waits"))
+        .unwrap_or_else(|err| panic!("join: {err}"));
+    assert!(matches!(failed, Err(CdpError::SessionGone)), "{failed:?}");
+    assert_eq!(
+        client.inner.pending.lock().await.len(),
+        1,
+        "another session's request keeps waiting for its own reply"
+    );
+    on_live.abort();
+    client.disconnect().await;
+}
+
+/// Has the loopback browser send one `method` event carrying `value`. Returns once the
+/// client's reader has routed it.
+async fn emit(client: &CdpClient, method: &str, value: u64) {
+    client
+        .send(
+            "Fixture.emit",
+            json!({ "method": method, "params": { "value": value } }),
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("emit {method}: {err}"));
+}
+
+fn take(receiver: &mut mpsc::UnboundedReceiver<CdpEvent>) -> CdpEvent {
+    receiver
+        .try_recv()
+        .unwrap_or_else(|err| panic!("no targeted event: {err}"))
+}
+
+fn take_broadcast(receiver: &mut broadcast::Receiver<Arc<CdpEvent>>) -> Arc<CdpEvent> {
+    receiver
+        .try_recv()
+        .unwrap_or_else(|err| panic!("no broadcast event: {err}"))
+}
+
+#[tokio::test]
+async fn every_targeted_subscriber_gets_each_event_and_the_broadcast_none() {
+    let browser = LoopbackBrowser::start().await;
+    let client = browser.connect().await;
+    let mut broadcast = client.events();
+    let mut playwright = client.events_targeted("Runtime.bindingCalled");
+    let mut takeover = client.events_targeted("Runtime.bindingCalled");
+
+    emit(&client, "Runtime.bindingCalled", 1).await;
+    emit(&client, "Runtime.bindingCalled", 2).await;
+    emit(&client, "Page.loadEventFired", 3).await;
+
+    for subscriber in [&mut playwright, &mut takeover] {
+        for value in [1, 2] {
+            let event = take(subscriber);
+            assert_eq!(event.method, "Runtime.bindingCalled");
+            assert_eq!(event.params["value"], value);
+        }
+        assert!(
+            subscriber.try_recv().is_err(),
+            "the page event, which nobody took, is not here"
+        );
+    }
+    assert_eq!(
+        take_broadcast(&mut broadcast).params["value"],
+        3,
+        "the broadcast skipped both binding calls"
+    );
+    client.disconnect().await;
+}
+
+#[tokio::test]
+async fn a_dropped_targeted_subscriber_is_forgotten_and_the_others_still_receive() {
+    let browser = LoopbackBrowser::start().await;
+    let client = browser.connect().await;
+    let mut broadcast = client.events();
+    let mut kept = client.events_targeted("Runtime.bindingCalled");
+    let gone = client.events_targeted("Runtime.bindingCalled");
+    drop(gone);
+
+    emit(&client, "Runtime.bindingCalled", 1).await;
+    assert_eq!(take(&mut kept).params["value"], 1);
+
+    drop(kept);
+    emit(&client, "Runtime.bindingCalled", 2).await;
+    assert_eq!(
+        take_broadcast(&mut broadcast).params["value"],
+        2,
+        "the first call reached the subscriber still live; with none left, the broadcast \
+         carries the method again"
+    );
+    client.disconnect().await;
+}
+
+/// Discovery points the URL at `[::1]` when the IPv6 loopback answered. The TCP connection
+/// must then resolve the bare address: `[::1]` with its brackets resolves to nothing.
+#[tokio::test]
+async fn a_websocket_url_on_every_loopback_spelling_resolves_to_a_socket_address()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (url, host) in [
+        ("ws://[::1]:9222/devtools/browser/abc", "::1"),
+        ("ws://127.0.0.1:9222/devtools/browser/abc", "127.0.0.1"),
+        ("ws://localhost:9222/devtools/browser/abc", "localhost"),
+    ] {
+        let url = Url::parse(url)?;
+        let tcp_host = tcp_host(&url)?;
+        assert_eq!(tcp_host, host);
+        let resolved = tokio::net::lookup_host((tcp_host.as_str(), 9222)).await?;
+        assert!(resolved.count() > 0, "{url} resolved to no address");
+    }
+    Ok(())
+}
+
+/// An event broadcast before `events_counted` subscribed is in its count; one after reaches its
+/// receiver. Neo's event watcher waits on that numbering, so an event in both would let an op
+/// resolve before its listener ran.
+#[tokio::test]
+async fn an_event_is_either_counted_before_a_subscription_or_received_by_it() {
+    let browser = LoopbackBrowser::start().await;
+    let client = browser.connect().await;
+    let event = r#"{"method":"Test.ping","params":{}}"#;
+    let start = client.events_broadcast();
+    handle_text_message(&client.inner, &Utf8Bytes::from(event)).await;
+    let (mut events, before) = client.events_counted();
+    handle_text_message(&client.inner, &Utf8Bytes::from(event)).await;
+    assert_eq!(before, start + 1);
+    assert_eq!(client.events_broadcast(), start + 2);
+    let mut received = 0;
+    while let Ok(received_event) = events.try_recv() {
+        if received_event.method == "Test.ping" {
+            received += 1;
+        }
+    }
+    assert_eq!(received, 1, "only the event after the subscription");
+}
+
+/// A message the browser writes with half of a UTF-16 pair: page text cut inside an emoji.
+/// Chromium escapes every non-ASCII unit, an intact pair as two escapes, a lone half as one.
+const HALVES: &str = r#""a\ud83db \ude00 \ud83d\ude00 \\ud800""#;
+const REPAIRED: &str = "a\u{fffd}b \u{fffd} \u{1f600} \\ud800";
+
+#[tokio::test]
+async fn a_lone_utf16_half_reaches_its_reply_and_events_as_the_replacement_character() {
+    let browser = LoopbackBrowser::start().await;
+    let client = browser.connect().await;
+    let mut broadcast = client.events();
+    let mut stream = client.on_event("Test.text");
+
+    let answer = json!({ "text": format!(r#"{{"id":{{id}},"result":{{"text":{HALVES}}}}}"#) });
+    let reply = client
+        .send("Fixture.answer_raw", answer.clone(), None)
+        .await
+        .unwrap_or_else(|err| panic!("the reply with lone halves: {err}"));
+    assert_eq!(reply["text"], REPAIRED);
+    let text = client
+        .send_raw_json("Fixture.answer_raw", &answer.to_string(), None)
+        .await
+        .unwrap_or_else(|err| panic!("the raw reply with lone halves: {err}"));
+    let parsed: Value =
+        serde_json::from_str(&text).unwrap_or_else(|err| panic!("the raw reply reads: {err}"));
+    assert_eq!(parsed["text"], REPAIRED);
+
+    client
+        .send(
+            "Fixture.emit_raw",
+            json!({ "text": format!(r#"{{"method":"Test.text","params":{{"text":{HALVES}}}}}"#) }),
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("emit the event with lone halves: {err}"));
+    assert_eq!(take_broadcast(&mut broadcast).params["text"], REPAIRED);
+    let streamed = timeout(Duration::from_secs(1), stream.recv())
+        .await
+        .unwrap_or_else(|_elapsed| panic!("the stream got no event"))
+        .unwrap_or_else(|err| panic!("stream: {err}"));
+    assert_eq!(streamed.params["text"], REPAIRED);
+    client.disconnect().await;
+}
+
+/// Nesting past serde's recursion limit is one message a repair cannot make readable.
+fn too_deep() -> String {
+    format!("{}0{}", "[".repeat(200), "]".repeat(200))
+}
+
+#[tokio::test]
+async fn a_reply_that_cannot_be_read_fails_its_request_at_once_and_an_event_is_dropped() {
+    let browser = LoopbackBrowser::start().await;
+    let client = browser.connect().await;
+    let mut broadcast = client.events();
+
+    // A request still waiting would end as `Timeout` after the fixture's two seconds.
+    let failed = client
+        .send(
+            "Fixture.answer_raw",
+            json!({ "text": format!(r#"{{"id":{{id}},"result":{}}}"#, too_deep()) }),
+            None,
+        )
+        .await;
+    match &failed {
+        Err(CdpError::Protocol { code, message }) => {
+            assert_eq!(*code, UNREADABLE_REPLY);
+            assert!(
+                message.starts_with("the browser's reply could not be read: recursion limit"),
+                "{message}"
+            );
+        }
+        other => panic!("expected the unreadable reply's error, got {other:?}"),
+    }
+
+    client
+        .send(
+            "Fixture.emit_raw",
+            json!({ "text": format!(r#"{{"method":"Test.deep","params":{}}}"#, too_deep()) }),
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("emit the unreadable event: {err}"));
+    emit(&client, "Test.after", 1).await;
+    assert_eq!(
+        take_broadcast(&mut broadcast).method,
+        "Test.after",
+        "the unreadable event is dropped and the reader goes on"
+    );
+    assert!(client.is_connected());
+    client.disconnect().await;
+}
+
+#[tokio::test]
+async fn a_close_frames_code_and_reason_reach_a_caller_whose_request_it_cut_off() {
+    for (params, expected) in [
+        (
+            json!({ "code": 4001, "reason": "renderer gone" }),
+            ConnectionLoss::Closed {
+                code: 4001,
+                reason: "renderer gone".to_owned(),
+            },
+        ),
+        (
+            json!({}),
+            ConnectionLoss::Closed {
+                code: 1005,
+                reason: String::new(),
+            },
+        ),
+    ] {
+        let browser = LoopbackBrowser::start().await;
+        let client = browser.connect().await;
+        assert_eq!(client.last_connection_loss(), None);
+        let cut_off = client.send("Fixture.close", params, None).await;
+        assert_eq!(cut_off, Err(CdpError::ConnectionLost));
+        assert_eq!(client.last_connection_loss(), Some(expected));
+        client.disconnect().await;
+    }
+}
+
+/// A stream skips the events of other methods on the shared event, and a broadcast reader
+/// checks an event's method through it, both without copying the event. The count is the
+/// bytes this thread allocated, so it holds whatever does the copying.
+#[tokio::test]
+async fn streams_and_broadcast_readers_make_no_copy_of_a_megabyte_event() {
+    const MIB: usize = 1 << 20;
+    let browser = LoopbackBrowser::start().await;
+    let client = browser.connect().await;
+    let mut readers: Vec<_> = (0..20).map(|_| client.events()).collect();
+    let mut streams: Vec<EventStream> = (0..20).map(|_| client.on_event("Test.small")).collect();
+    let large = json!({ "method": "Test.large", "params": { "text": "x".repeat(MIB) } });
+    handle_text_message(&client.inner, &Utf8Bytes::from(large.to_string())).await;
+    handle_text_message(
+        &client.inner,
+        &Utf8Bytes::from_static(r#"{"method":"Test.small","params":{}}"#),
+    )
+    .await;
+
+    let before = alloc_count::allocated();
+    for reader in &mut readers {
+        let event = reader
+            .recv()
+            .await
+            .unwrap_or_else(|err| panic!("broadcast: {err}"));
+        assert_eq!(event.method, "Test.large");
+    }
+    let read = alloc_count::allocated() - before;
+    assert!(
+        read < MIB / 16,
+        "twenty broadcast readers of a 1 MiB event allocated {read} bytes"
+    );
+
+    let before = alloc_count::allocated();
+    for stream in &mut streams {
+        let event = stream
+            .recv()
+            .await
+            .unwrap_or_else(|err| panic!("stream: {err}"));
+        assert_eq!(event.method, "Test.small");
+    }
+    let skipped = alloc_count::allocated() - before;
+    assert!(
+        skipped < MIB / 16,
+        "twenty streams that skipped a 1 MiB event allocated {skipped} bytes"
+    );
+
+    let before = alloc_count::allocated();
+    let copy = large.clone();
+    assert!(
+        alloc_count::allocated() - before >= MIB,
+        "the count sees a deep copy"
+    );
+    drop(copy);
+    client.disconnect().await;
+}
+
+/// A reply of `rows` small arrays, the shape of a DOM capture's columns: a parsed `Value` of it
+/// takes tens of times its text.
+fn columns(rows: usize) -> String {
+    let rows: Vec<String> = (0..rows).map(|row| format!("[{row}]")).collect();
+    format!("[{}]", rows.join(","))
+}
+
+/// Registers a request the test answers itself through `handle_text_message`, as the reader
+/// loop would on the browser's reply.
+async fn pending(client: &CdpClient, id: u64) -> oneshot::Receiver<Result<RawReply, CdpError>> {
+    let (reply, receiver) = oneshot::channel();
+    client.inner.pending.lock().await.insert(
+        id,
+        Pending {
+            session: None,
+            reply,
+        },
+    );
+    receiver
+}
+
+/// The reader loop's whole work on a large reply is checking it is JSON: it hands over a slice of
+/// the message and builds no tree, so the next message, another session's reply, is handled
+/// while the first is still undecoded. The decode runs where the caller awaits it, and is what
+/// allocates the tree. On the loop, it would hold up every message behind it for as long as it
+/// took.
+#[tokio::test]
+async fn the_reader_hands_a_large_reply_over_as_text_and_its_caller_decodes_it() {
+    let browser = LoopbackBrowser::start().await;
+    let client = browser.connect().await;
+    let large = columns(50_000);
+    let mut first = pending(&client, 9_001).await;
+    let mut other = pending(&client, 9_002).await;
+
+    let message = Utf8Bytes::from(format!(
+        r#"{{"id":9001,"result":{large},"sessionId":"tab-a"}}"#
+    ));
+
+    let before = alloc_count::allocated();
+    handle_text_message(&client.inner, &message).await;
+    let on_loop = alloc_count::allocated() - before;
+    assert!(
+        on_loop < 4096,
+        "the reader allocated {on_loop} bytes for a {} byte result",
+        large.len()
+    );
+
+    handle_text_message(
+        &client.inner,
+        &Utf8Bytes::from_static(r#"{"id":9002,"result":{"value":1},"sessionId":"tab-b"}"#),
+    )
+    .await;
+    let small = other
+        .try_recv()
+        .unwrap_or_else(|err| panic!("the other session's reply was not delivered: {err}"))
+        .unwrap_or_else(|err| panic!("the other session's reply: {err}"));
+    assert_eq!(small.get(), r#"{"value":1}"#);
+
+    let kept = first
+        .try_recv()
+        .unwrap_or_else(|err| panic!("the large reply was not delivered: {err}"))
+        .unwrap_or_else(|err| panic!("the large reply: {err}"));
+    assert_eq!(kept.get(), large, "handed over undecoded, as written");
+    let before = alloc_count::allocated();
+    let rows: Vec<[u32; 1]> = kept.decode().unwrap_or_else(|err| panic!("decode: {err}"));
+    assert_eq!(rows.len(), 50_000);
+    drop(rows);
+    let tree: Value = kept.decode().unwrap_or_else(|err| panic!("decode: {err}"));
+    assert!(
+        alloc_count::allocated() - before >= 4 * large.len(),
+        "the caller's decodes build what the loop did not"
+    );
+    drop(tree);
+    client.disconnect().await;
+}
+
+/// `send_raw_json` and `send_raw` return the browser's own text, which no parse and re-encode
+/// would keep: spacing, key order and escapes. `send_typed` decodes it into the caller's type.
+#[tokio::test]
+async fn raw_sends_return_the_browsers_text_and_typed_sends_decode_it() {
+    let browser = LoopbackBrowser::start().await;
+    let client = browser.connect().await;
+    let written = r#"{ "b": [1,  2.50], "a": "\u00e9" }"#;
+    let answer = json!({ "text": format!(r#"{{"id":{{id}},"result":{written}}}"#) });
+
+    let text = client
+        .send_raw_json("Fixture.answer_raw", &answer.to_string(), None)
+        .await
+        .unwrap_or_else(|err| panic!("send_raw_json: {err}"));
+    assert_eq!(text, written);
+    let kept = client
+        .send_raw("Fixture.answer_raw", answer.clone(), None)
+        .await
+        .unwrap_or_else(|err| panic!("send_raw: {err}"));
+    assert_eq!(kept.get(), written);
+
+    #[derive(Debug, serde::Deserialize, PartialEq)]
+    struct Answer {
+        a: String,
+        b: Vec<f64>,
+    }
+    let typed: Answer = client
+        .send_typed("Fixture.answer_raw", answer, None)
+        .await
+        .unwrap_or_else(|err| panic!("send_typed: {err}"));
+    assert_eq!(
+        typed,
+        Answer {
+            a: "\u{e9}".to_owned(),
+            b: vec![1.0, 2.5],
+        }
+    );
+    client.disconnect().await;
+}
